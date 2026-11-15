@@ -1,0 +1,75 @@
+name: HSE pending scene-change timeout real OCR A/B
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-pending-timeout-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  pending-timeout-real:
+    if: ${{ contains(github.event.head_commit.message, '[hse-pending-timeout-qa]') }}
+    runs-on: windows-2025
+    timeout-minutes: 32
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create isolated verified Windows research environment
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'Windows x64 required'
+          }
+          if (Test-Path .venv-hse-pending) { throw 'temporary environment exists unexpectedly' }
+          python -m venv .venv-hse-pending
+          if ($LASTEXITCODE -ne 0) { throw 'isolated research venv failed' }
+          (Resolve-Path .venv-hse-pending\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Validate real model runtime and fail-closed detector / scoring
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -m pip install -e ".[ocr]"
+          if ($LASTEXITCODE -ne 0) { throw 'pinned OCR dependencies not ready' }
+          foreach ($file in @('test_detector_sampling.py','test_quiet_detector_window_audit.py','test_pending_timeout_ab_report.py','test_quiet_cap_trial_report.py','test_multiline_streaming_quality_report.py','test_rapidocr_subtitle_filter.py')) {
+            python -B -m unittest discover -s tests -p $file -v
+            if ($LASTEXITCODE -ne 0) { throw "independent regression failed: $file" }
+          }
+      - name: Verify existing LGPL FFmpeg source binaries
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'verified FFmpeg unavailable' }
+      - name: Compare exact JA/ZH source MP4 using true baseline and guarded timeouts with separate blank controls
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-pending-ab-$env:GITHUB_RUN_ID"
+          if (Test-Path $scratch) { throw 'scratch directory collision' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          try {
+            $models = Join-Path $scratch 'models'
+            python -B tools/prepare_models.py --languages ko,en,zh --out $models *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'verified PP-OCRv5 model assets missing' }
+            python -B tools/compare_pending_timeout_ab.py --model-dir $models
+            if ($LASTEXITCODE -ne 0) { throw 'bounded real-model A/B study incomplete' }
+          }
+          finally {
+            Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Remove isolated runtime on exit
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Remove-Item .venv-hse-pending -Recurse -Force -ErrorAction SilentlyContinue

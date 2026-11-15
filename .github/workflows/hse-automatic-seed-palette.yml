@@ -1,0 +1,68 @@
+name: HSE automatic OCR-seeded palette timing A/B research
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-unsupervised-palette-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  automatic-seeds:
+    if: ${{ contains(github.event.head_commit.message, '[hse-auto-seed-palette]') }}
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Isolate four-model Windows research environment
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'real Windows x64 model evaluation required'
+          }
+          python -m venv .venv-hse-palette-auto
+          if ($LASTEXITCODE -ne 0) { throw 'isolated environment unavailable' }
+          (Resolve-Path .venv-hse-palette-auto\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install verified OCR runtime and run negative controls
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[ocr]"
+          if ($LASTEXITCODE -ne 0) { throw 'OCR runtime installation failed' }
+          python -B -m unittest discover -s tests -p test_auto_seeded_palette_timing.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'automatic seed quality isolation regressions failed' }
+          python -B -m unittest discover -s tests -p test_palette_ink_boundary.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'palette visual boundary regression' }
+      - name: Verify pinned MPEG-4 source transport
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'pinned FFmpeg unavailable' }
+      - name: Real multi-language moving MP4 with no reference-chosen OCR frames
+        shell: pwsh
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-auto-palette-$env:GITHUB_RUN_ID"
+          if (Test-Path $scratch) { throw 'research scratch already exists' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          try {
+            $models = Join-Path $scratch 'models'
+            python -B tools/prepare_models.py --languages ko,en,zh --out $models *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'verified OCR model preparation failed' }
+            python -B tools/compare_auto_seeded_palette_timing.py --model-dir $models
+            if ($LASTEXITCODE -ne 0) { throw 'automatic seed A/B did not complete' }
+          }
+          finally {
+            Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Remove isolated runtime
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Remove-Item .venv-hse-palette-auto -Recurse -Force -ErrorAction SilentlyContinue

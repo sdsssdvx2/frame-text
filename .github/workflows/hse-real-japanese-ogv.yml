@@ -1,0 +1,87 @@
+name: HSE genuine Japanese OGV hard-OCR and same-clip FPS study (research HOLD)
+
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+
+permissions:
+  contents: read
+
+jobs:
+  real-japanese-ogv:
+    if: ${{ contains(github.event.head_commit.message, '[hse-real-natural-ja-ogv]') || contains(github.event.head_commit.message, '[hse-natural-ja-fps]') || contains(github.event.head_commit.message, '[hse-natural-ja-openvino]') }}
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare bounded temporary official FFmpeg and local OCR models
+        shell: pwsh
+        env:
+          PYTHONPATH: src
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'real Windows x64 only' }
+          $scratch=Join-Path $env:RUNNER_TEMP ("hse-real-ja-ogv-" + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
+          if (Test-Path -LiteralPath $scratch) { throw 'temporary scratch already exists' }
+          New-Item -Path $scratch -ItemType Directory | Out-Null
+          "HSE_JA_SCRATCH=$scratch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $venv=Join-Path $scratch 'venv'
+          python -m venv $venv
+          if ($LASTEXITCODE -ne 0) { throw 'isolated Python setup failed' }
+          $py=Join-Path $venv 'Scripts/python.exe'
+          & $py -m pip install --disable-pip-version-check -e ".[ocr,accelerated]" *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'free HSE OCR dependencies unavailable' }
+          $bin=Join-Path $scratch 'bin'
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1 -Destination $bin
+          if ($LASTEXITCODE -ne 0) { throw 'SHA-pinned official LGPL FFmpeg unavailable' }
+          $models=Join-Path $scratch 'models'
+          & $py -B tools/prepare_models.py --languages zh --out $models *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'SHA-pinned free JA/CJK OCR models unavailable' }
+          "HSE_JA_PY=$py" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HSE_JA_MODELS=$models" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HSE_FFMPEG=$(Join-Path $bin 'ffmpeg.exe')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HSE_FFPROBE=$(Join-Path $bin 'ffprobe.exe')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Exact same real Japanese clip default versus 12fps and 8fps OCR
+        shell: pwsh
+        env:
+          PYTHONPATH: src
+          PYTHONDONTWRITEBYTECODE: '1'
+          HSE_JA_FPS_MODE: ${{ contains(github.event.head_commit.message, '[hse-natural-ja-fps]') }}
+          HSE_JA_OPENVINO_MODE: ${{ contains(github.event.head_commit.message, '[hse-natural-ja-openvino]') }}
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:HSE_JA_OPENVINO_MODE -eq 'true') {
+            & $env:HSE_JA_PY -B tools/compare_real_japanese_openvino.py --scratch (Join-Path $env:HSE_JA_SCRATCH 'openvino') --model-dir $env:HSE_JA_MODELS --approve-cc-by-download
+            if ($LASTEXITCODE -ne 0) { throw 'Japanese same-clip OpenVINO comparison failed without retry' }
+            return
+          }
+          if ($env:HSE_JA_FPS_MODE -eq 'true') {
+            & $env:HSE_JA_PY -B tools/compare_real_japanese_fps.py --scratch (Join-Path $env:HSE_JA_SCRATCH 'research') --model-dir $env:HSE_JA_MODELS --approve-cc-by-download
+            if ($LASTEXITCODE -ne 0) { throw 'Japanese same-clip FPS comparison failed without retry' }
+            return
+          }
+          foreach ($suite in @('test_local_batch.py', 'test_subtitle_review_pack.py', 'test_gui_local_input.py')) {
+            & $env:HSE_JA_PY -B -m unittest discover -s tests -p $suite -q
+            if ($LASTEXITCODE -ne 0) { throw "OGV local input or source review regression: $suite" }
+          }
+          # Public video provenance and attribution are explicitly approved
+          # for this ONE CI job. No redistribution of video/frames/text.
+          & $env:HSE_JA_PY -B tools/verify_real_japanese_ogv.py --scratch (Join-Path $env:HSE_JA_SCRATCH 'media') --model-dir $env:HSE_JA_MODELS --approve-cc-by-download
+          if ($LASTEXITCODE -ne 0) { throw 'natural Japanese OGV end-to-end remains HOLD' }
+      - name: Remove only this job owned scratch and publisher media
+        if: always()
+        shell: pwsh
+        run: |
+          $expected=Join-Path $env:RUNNER_TEMP ("hse-real-ja-ogv-" + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
+          if ($env:HSE_JA_SCRATCH -and [string]::Equals(
+              $env:HSE_JA_SCRATCH, $expected, [System.StringComparison]::OrdinalIgnoreCase
+          ) -and (Test-Path -LiteralPath $expected)) {
+            Remove-Item -LiteralPath $expected -Recurse -Force -ErrorAction SilentlyContinue
+          }

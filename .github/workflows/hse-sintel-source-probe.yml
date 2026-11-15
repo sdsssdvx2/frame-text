@@ -1,0 +1,41 @@
+name: HSE licensed Sintel animation source provenance (research)
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-sintel-provenance-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  verify-w3c-source:
+    if: ${{ contains(github.event.head_commit.message, '[hse-sintel-source-probe]') }}
+    runs-on: windows-2025
+    timeout-minutes: 13
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Provision isolated FFprobe without system install
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'read-only source probe requires existing isolated Windows runner'
+          }
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'SHA-pinned FFprobe unavailable' }
+      - name: Fingerprint exact W3C-hosted original animation, no OCR
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -B tools/probe_sintel_original_animation.py --fingerprint-only
+          if ($LASTEXITCODE -ne 0) { throw 'cannot fingerprint original film bytes' }
+          # Temporary directories and media are deleted by Python even on errors.

@@ -1,0 +1,287 @@
+name: HSE real Windows Tk local subtitle end-to-end acceptance
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-real-tk-local-e2e
+  cancel-in-progress: false
+
+jobs:
+  tk-local-mkv:
+    if: contains(github.event.head_commit.message, '[hse-real-gui-e2e]') || contains(github.event.head_commit.message, '[hse-real-batch-50]')
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create truly disposable Windows real-GUI test venv
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'Real Windows x64 GUI host required'
+          }
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-real-gui-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $scratch) {
+            throw 'Unexpected existing GUI test venv path'
+          }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          python -m venv (Join-Path $scratch 'venv')
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated Tk acceptance venv setup failed' }
+          (Resolve-Path (Join-Path $scratch 'venv\Scripts')).Path |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "HSE_REAL_TK_SCRATCH=$scratch" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Prepare app imports without installing or launching HSE
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -e .
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated source dependencies failed' }
+      - name: Prepare SHA-pinned LGPL FFmpeg and FFprobe
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Independently verified FFmpeg unavailable' }
+      - name: Re-run baseline real Tk callback and safe local-track unit tests
+        if: "!contains(github.event.head_commit.message, '[hse-bitmap-only]') && !contains(github.event.head_commit.message, '[hse-real-batch-50]')"
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          # One focused regression for the Explorer multi-select GUI
+          # and dispatch signature. EpSite/model/long-form source paths were
+          # independently verified in prior CI and are not re-run here.
+          foreach ($pattern in @(
+            'test_local_batch*.py',
+            'test_local_output_audit.py',
+            'test_local_image_subtitles.py',
+            'test_local_bitmap_bdn_ocr.py',
+            'test_gui_local_input.py',
+            'test_gui_public_captions.py'
+          )) {
+            python -B -m unittest discover -s tests -p $pattern -v
+            if ($LASTEXITCODE -ne 0) {
+              throw "Targeted local video regression failed: $pattern"
+            }
+          }
+          python -B tools/hse_gui_tk_smoke.py
+          if ($LASTEXITCODE -ne 0) { throw 'Baseline actual Tk widget invocation unavailable' }
+      - name: Real Tk Start + worker + MKV embedded / SRT-VTT sidecar output verify
+        if: "!contains(github.event.head_commit.message, '[hse-bitmap-only]') && !contains(github.event.head_commit.message, '[hse-real-batch-50]')"
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -B tools/verify_real_gui_local_subtitles.py
+          if ($LASTEXITCODE -ne 0) { throw 'GUI-to-FFmpeg embedded/sidecar subtitle acceptance failed' }
+      - name: Real 50-file FFmpeg original text batch cancel-resume and Python heap
+        if: contains(github.event.head_commit.message, '[hse-real-batch-50]')
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -B tools/verify_real_50_local_batch_recovery.py
+          if ($LASTEXITCODE -ne 0) { throw 'Real 50 encoded MKV cancellation/resume proof failed' }
+      - name: Prepare pinned free Subtitle Edit seconv and actual bitmap-track MKV
+        if: contains(github.event.head_commit.message, '[hse-local-bitmap-seconv]') || contains(github.event.head_commit.message, '[hse-bitmap-ppocr]') || contains(github.event.head_commit.message, '[hse-seconv-stage]') || contains(github.event.head_commit.message, '[hse-bitmap-roundtrip]')
+        shell: pwsh
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-seconv-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $scratch) { throw 'Non-empty seconv study target' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          "HSE_SECONV_RESEARCH_SCRATCH=$scratch" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $release = "https://github.com/SubtitleEdit/subtitleedit/releases/download/v5.3.0/SeConv-Windows-x64.zip"
+          $zip = Join-Path $scratch "SeConv-Windows-x64.zip"
+          Invoke-WebRequest -Uri $release -OutFile $zip -MaximumRedirection 8
+          if (-not (Test-Path $zip)) { throw 'Pinned upstream seconv release unavailable' }
+          $digest = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($digest -ne '1bcafcd5fd84d445b92d33dbfef3b95d268e5d36df34272c003d83d1f37b72f7') {
+            throw 'Pinned seconv archive SHA mismatch'
+          }
+          $extract = Join-Path $scratch 'portable'
+          Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+          $matches = @(Get-ChildItem -LiteralPath $extract -Filter 'seconv.exe' -File -Recurse)
+          if ($matches.Count -ne 1) { throw 'Expected one portable official seconv executable' }
+          $ref = 'v5.3.0'
+          $origin = "https://raw.githubusercontent.com/SubtitleEdit/subtitleedit/$ref"
+          $fixture = Join-Path $scratch 'container_image.mkv'
+          $nocr = Join-Path $scratch 'Latin.nocr'
+          Invoke-WebRequest -Uri "$origin/tests/seconv/Fixtures/container_image.mkv" -OutFile $fixture
+          Invoke-WebRequest -Uri "$origin/Ocr/Latin.nocr" -OutFile $nocr
+          if ((git hash-object $fixture).Trim() -ne '00f688a58c7d6606fb4128b56f8272f8fe15fed1') {
+            throw 'Upstream image-track MKV Git blob SHA mismatch'
+          }
+          if ((git hash-object $nocr).Trim() -ne 'cf4d34d54178648c8161367dee07b47442ed7e7f') {
+            throw 'Upstream free Latin OCR database Git blob SHA mismatch'
+          }
+          "HSE_SECONV=$($matches[0].FullName)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HSE_NOCR_DB=$nocr" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HSE_SECONV_SAMPLE=$fixture" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HSE_SECONV_RESEARCH_MODE=PINNED_PORTABLE;NO_INSTALL=TRUE"
+      - name: Real pinned portable SeConv bitmap-track OCR and exclusive export
+        if: contains(github.event.head_commit.message, '[hse-local-bitmap-seconv]') || contains(github.event.head_commit.message, '[hse-bitmap-ppocr]')
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+          DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+          DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+        run: |
+          python -B tools/verify_local_image_seconv.py --fixture $env:HSE_SECONV_SAMPLE --scratch $env:HSE_SECONV_RESEARCH_SCRATCH
+          if ($LASTEXITCODE -ne 0) { throw 'Real pinned bitmap OCR failed' }
+      - name: Test bounded BDN images and shared lazy multilingual OCR routing
+        if: contains(github.event.head_commit.message, '[hse-bitmap-ppocr]')
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -B -m unittest discover -s tests -p test_local_bitmap_bdn_ocr.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'BDN image/OCR parser contracts failed' }
+          python -B -m unittest discover -s tests -p test_local_batch.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Shared lazy local OCR routing changed' }
+      - name: Prepare pinned OCR model languages for real image-track study
+        if: contains(github.event.head_commit.message, '[hse-bitmap-ppocr]') || contains(github.event.head_commit.message, '[hse-bitmap-roundtrip]')
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -e ".[ocr]"
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned RapidOCR runtime unavailable' }
+          $languages = if ('${{ contains(github.event.head_commit.message, '[hse-bitmap-roundtrip]') }}' -eq 'true') { 'ko,en,zh' } else { 'en' }
+          python -B tools/prepare_models.py --languages $languages *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned OCR language model unavailable' }
+      - name: Real free PGS and VobSub image export through existing HSE PP-OCR model
+        if: contains(github.event.head_commit.message, '[hse-bitmap-ppocr]')
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+          DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+        run: |
+          python -B tools/verify_local_bitmap_ppocr_real.py --fixture $env:HSE_SECONV_SAMPLE --scratch $env:HSE_SECONV_RESEARCH_SCRATCH --model-dir models/runtime --manifest models/manifest.json
+          if ($LASTEXITCODE -ne 0) { throw 'Real bundled PP-OCR Matroska bitmap conversion failed' }
+      - name: Measure real PGS and VobSub source-known multilingual roundtrip OCR
+        if: contains(github.event.head_commit.message, '[hse-bitmap-roundtrip]')
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+          DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+        run: |
+          python -B tools/verify_known_text_bitmap_codecs.py --scratch $env:HSE_SECONV_RESEARCH_SCRATCH --seconv $env:HSE_SECONV --model-dir models/runtime --manifest models/manifest.json
+          if ($LASTEXITCODE -ne 0) { throw 'Real source-known PGS/VobSub study did not complete' }
+      - name: Stage/verify free portable seconv for future frozen EXE
+        if: contains(github.event.head_commit.message, '[hse-seconv-stage]')
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:HSE_SECONV_RESEARCH_SCRATCH 'SeConv-Windows-x64.zip'
+          pwsh -NoProfile -File tools/prepare_seconv_ci.ps1 -ArchivePath $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned free seconv portable staging failed' }
+          $manifest = Get-Content artifacts/seconv-provenance.json -Raw | ConvertFrom-Json
+          $app = Join-Path (Get-Location) 'bin/seconv/seconv.exe'
+          if (-not (Test-Path -LiteralPath $app) -or
+              $manifest.archive_sha256 -ne '1bcafcd5fd84d445b92d33dbfef3b95d268e5d36df34272c003d83d1f37b72f7' -or
+              (Get-FileHash $app -Algorithm SHA256).Hash.ToLowerInvariant() -ne
+                $manifest.portable_exe_sha256) {
+            throw 'Staged seconv changed or provenance mismatch'
+          }
+          Write-Host "HSE_FREE_SECONV_STAGED=PASS; FILES=$($manifest.file_count); USER_INSTALL=NONE"
+      - name: Clean isolated staged converter after package-prep proof
+        if: always() && contains(github.event.head_commit.message, '[hse-seconv-stage]')
+        shell: pwsh
+        run: |
+          $stage = Join-Path (Get-Location) 'bin/seconv'
+          if ((Test-Path 'artifacts/seconv-provenance.json') -and
+              (Test-Path -LiteralPath (Join-Path $stage 'seconv.exe'))) {
+            Remove-Item -LiteralPath $stage -Recurse -Force
+          }
+      - name: Clean only the pinned bitmap OCR research scratch
+        if: always() && (contains(github.event.head_commit.message, '[hse-local-bitmap-seconv]') || contains(github.event.head_commit.message, '[hse-bitmap-ppocr]') || contains(github.event.head_commit.message, '[hse-seconv-stage]') || contains(github.event.head_commit.message, '[hse-bitmap-roundtrip]'))
+        shell: pwsh
+        run: |
+          $scratch = $env:HSE_SECONV_RESEARCH_SCRATCH
+          if ($scratch -and $scratch.StartsWith($env:RUNNER_TEMP) -and
+              (Test-Path -LiteralPath $scratch)) {
+            Remove-Item -LiteralPath $scratch -Recurse -Force
+          }
+      - name: Clean only this run's isolated Python environment
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:HSE_REAL_TK_SCRATCH -and
+              $env:HSE_REAL_TK_SCRATCH.StartsWith($env:RUNNER_TEMP)) {
+            Remove-Item -LiteralPath $env:HSE_REAL_TK_SCRATCH -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+  private-frame-review-gui:
+    if: contains(github.event.head_commit.message, '[hse-review-gui]')
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare disposable Tk review environment
+        shell: pwsh
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-private-review-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $scratch) { throw 'unsafe scratch collision' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          python -m venv (Join-Path $scratch 'venv')
+          if ($LASTEXITCODE -ne 0) { throw 'private Tk venv setup failed' }
+          (Resolve-Path (Join-Path $scratch 'venv/Scripts')).Path |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "HSE_REVIEW_GUI_SCRATCH=$scratch" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install normal free app dependencies into scratch only
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -e . *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Tk dependencies not available' }
+      - name: Targeted private review and native Windows Tk widget checks
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          foreach ($name in @(
+            'test_gui_frame_review.py',
+            'test_subtitle_review_pack.py',
+            'test_gui_local_input.py',
+            'test_gui_diagnostic_privacy.py',
+            'test_multilingual_gui.py',
+            'test_public_output_resume_routing.py',
+            'test_external_subprocess.py',
+            'test_quality_audit.py',
+            'test_frozen_frame_review_acceptance.py'
+          )) {
+            python -B -m unittest discover -s tests -p $name -v
+            if ($LASTEXITCODE -ne 0) { throw "review GUI regression failed: $name" }
+          }
+          python -B tools/hse_gui_tk_smoke.py
+          if ($LASTEXITCODE -ne 0) { throw 'native Tk mode/control smoke failed' }
+          Write-Host 'HSE_REVIEW_GUI_TARGETED_PASS=TRUE;NETWORK_MEDIA=NONE;USER_FILES_UNCHANGED=TRUE'
+      - name: Clean isolated review environment
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:HSE_REVIEW_GUI_SCRATCH -and
+              $env:HSE_REVIEW_GUI_SCRATCH.StartsWith($env:RUNNER_TEMP)) {
+            Remove-Item -LiteralPath $env:HSE_REVIEW_GUI_SCRATCH -Recurse -Force -ErrorAction SilentlyContinue
+          }

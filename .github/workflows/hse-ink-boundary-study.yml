@@ -1,0 +1,71 @@
+name: HSE OCR-seeded visual boundary refinement study
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-ink-boundary-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ink-boundary:
+    if: ${{ contains(github.event.head_commit.message, '[hse-ink-boundary-study]') }}
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Isolate model and frame-processing dependencies
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw "real Windows x64 model runner required"
+          }
+          python -m venv .venv-hse-ink-boundary
+          if ($LASTEXITCODE -ne 0) { throw "venv creation failed" }
+          (Resolve-Path .venv-hse-ink-boundary\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install verified production OCR requirements
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[ocr]"
+          if ($LASTEXITCODE -ne 0) { throw "OCR dependencies not installed" }
+      - name: Test pure anchored-ink logic with blank and moving controls
+        shell: pwsh
+        run: |
+          python -B -m unittest discover -s tests -p test_ink_boundary_refinement.py -v
+          if ($LASTEXITCODE -ne 0) { throw "ink experiment unit regressions failed" }
+      - name: Verify official pinned FFmpeg codecs
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw "pinned ffmpeg setup failed" }
+      - name: OCR anchor geometry from real PP-OCRv5 in all four languages
+        shell: pwsh
+        run: |
+          $sandbox = Join-Path $env:RUNNER_TEMP "hse-ink-boundary-$env:GITHUB_RUN_ID"
+          if (Test-Path $sandbox) { throw "isolated model folder already exists" }
+          $models = Join-Path $sandbox "models"
+          New-Item -ItemType Directory -Path $sandbox | Out-Null
+          try {
+            python -B tools/prepare_models.py --languages ko,en,zh --out $models *> $null
+            if ($LASTEXITCODE -ne 0) { throw "SHA-pinned OCR models unavailable" }
+            python -B tools/experiment_ink_boundary_refinement.py --model-dir $models
+            if ($LASTEXITCODE -ne 0) {
+              throw "benchmark failed to complete; do not promote a candidate"
+            }
+          }
+          finally {
+            Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Remove isolated test runtime
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Remove-Item .venv-hse-ink-boundary -Recurse -Force -ErrorAction SilentlyContinue

@@ -1,0 +1,84 @@
+name: HSE real Sintel moving-film OCR against official native VSF (research)
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-sintel-actual-vsf-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  pinned-licensed-film-hse-vsf:
+    if: ${{ contains(github.event.head_commit.message, '[hse-sintel-film-ocr]') }}
+    runs-on: windows-2025
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create disposable test Python environment, never touch installed HSE
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'only isolated pinned Windows x64 research is permitted'
+          }
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-film-ocr-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $scratch) { throw 'research scratch collision' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          python -m venv (Join-Path $scratch 'venv')
+          if ($LASTEXITCODE -ne 0) { throw 'disposable OCR venv failed' }
+          (Resolve-Path (Join-Path $scratch 'venv\Scripts')).Path |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "HSE_SINTEL_SCRATCH=$scratch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install sandboxed declared OCR dependencies and validate scorer
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -m pip install --disable-pip-version-check -e ".[ocr]" *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'pinned OCR runtime dependencies unavailable' }
+          python -B -m unittest discover -s tests -p test_vsf_hse_combined_research.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'VSF combined benchmark contract failed' }
+          python -B -m unittest discover -s tests -p test_external_engine_exports.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'transcript and line-wrap grader contract failed' }
+      - name: Prepare independently SHA-verified LGPL source decoder
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'pinned FFmpeg/FFprobe unavailable' }
+      - name: Four real models over exact SHA-pinned published animation scenes
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          if (-not $env:HSE_SINTEL_SCRATCH) { throw 'missing disposable scratch' }
+          $models = Join-Path $env:HSE_SINTEL_SCRATCH 'models'
+          try {
+            python -B tools/prepare_models.py --languages ko,en,zh --out $models *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'SHA-pinned PP-OCRv5 model setup failed' }
+            python -B tools/compare_sintel_real_film_hard_ocr.py --model-dir $models
+            if ($LASTEXITCODE -ne 0) { throw 'real animation versus VSF study did not complete' }
+          }
+          finally {
+            # The benchmark itself deletes original and derived film media.
+            # Neither models nor media leave the runner.
+            if ($env:HSE_SINTEL_SCRATCH.StartsWith($env:RUNNER_TEMP)) {
+              Remove-Item -LiteralPath $env:HSE_SINTEL_SCRATCH -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+      - name: Discard only own disposable test environment
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:HSE_SINTEL_SCRATCH -and
+              $env:HSE_SINTEL_SCRATCH.StartsWith($env:RUNNER_TEMP)) {
+            Remove-Item -LiteralPath $env:HSE_SINTEL_SCRATCH -Recurse -Force -ErrorAction SilentlyContinue
+          }

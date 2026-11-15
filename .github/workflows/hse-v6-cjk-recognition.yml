@@ -1,0 +1,75 @@
+name: HSE SHA-pinned PP-OCRv6-small CJK recognition research
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-v6-cjk-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  v6-cjk-research:
+    if: ${{ contains(github.event.head_commit.message, '[hse-v6-cjk-qa]') }}
+    runs-on: windows-2025
+    timeout-minutes: 28
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Provision isolated Windows PP-OCR comparison environment
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'exact Windows x64 OCR runtime required'
+          }
+          if (Test-Path .venv-hse-v6-cjk) { throw 'research venv path already exists' }
+          python -m venv .venv-hse-v6-cjk
+          if ($LASTEXITCODE -ne 0) { throw 'research Python isolation failed' }
+          (Resolve-Path .venv-hse-v6-cjk\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install exact HSE runtime and reject model-integrity bypass
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -m pip install -e ".[ocr]"
+          if ($LASTEXITCODE -ne 0) { throw 'HSE pinned OCR runtime install failure' }
+          python -B -m unittest discover -s tests -p test_v6_cjk_research_integrity.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'PP-OCRv6 official model research integrity failed' }
+          python -B -m unittest discover -s tests -p test_raw_multiline_model_filter.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'raw subtitle/geometry regression failed' }
+      - name: Prepare pinned LGPL video codec
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'official codec provenance check failed' }
+      - name: Compare V5 versus V6 on independent pinned 48 JA/ZH film frames
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-cjk-v6-$env:GITHUB_RUN_ID"
+          if (Test-Path $scratch) { throw 'model sandbox collision' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          try {
+            $models = Join-Path $scratch 'v5-reference'
+            python -B tools/prepare_models.py --languages zh --out $models *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'reference V5 model SHA mismatch' }
+            python -B tools/compare_cjk_v5_v6_recognition.py --model-dir $models --pinned-groundtruth-ja-zh --approve-cc-dataset-download
+            if ($LASTEXITCODE -ne 0) { throw 'official V6 isolated recognition comparison did not finish' }
+          }
+          finally {
+            Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Remove isolated Windows research environment
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Remove-Item .venv-hse-v6-cjk -Recurse -Force -ErrorAction SilentlyContinue

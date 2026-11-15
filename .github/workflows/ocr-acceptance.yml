@@ -1,0 +1,44 @@
+name: OCR acceptance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ocr-acceptance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  korean-ocr:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[ocr]"
+      - name: Prepare pinned FFmpeg
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+      - name: Generate deterministic synthetic fixtures
+        run: |
+          python tools/make_synthetic_fixture.py
+          python tools/make_stress_fixture.py
+      - name: Unit and synthetic tests
+        run: python -m unittest discover -s tests -v
+      - name: Prepare verified OCR models
+        run: python tools/prepare_models.py
+      - name: Real PP-OCRv5 Korean synthetic acceptance
+        run: python tools/rapidocr_acceptance.py --assert-quality
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          retention-days: 5
+          name: ocr-acceptance
+          path: artifacts/

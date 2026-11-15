@@ -1,0 +1,81 @@
+name: HSE real Sintel JA timed streaming OCR end-to-end
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-sintel-stream-ja-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  real-mp4-stream:
+    if: ${{ contains(github.event.head_commit.message, '[hse-sintel-stream-qa]') }}
+    runs-on: windows-2025
+    timeout-minutes: 26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Isolate model and video trial in disposable temp environment
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'Windows x64 required'
+          }
+          $root = Join-Path $env:RUNNER_TEMP "hse-sintel-stream-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $root) { throw 'temporary runtime collision' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          python -m venv (Join-Path $root 'venv')
+          if ($LASTEXITCODE -ne 0) { throw 'isolated venv failed' }
+          (Resolve-Path (Join-Path $root 'venv\Scripts')).Path |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "HSE_SINTEL_STREAM_TMP=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install declared OCR and verify stream/interval contracts
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -m pip install --disable-pip-version-check -e ".[ocr]" *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'isolated OCR runtime setup failed' }
+          python -B -m unittest discover -s tests -p test_timed_ocr_streaming.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'streaming contract must be verified' }
+          python -B -m unittest discover -s tests -p test_vsf_timing_research.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'official VSF binary isolation contracts failed' }
+          python -B -m unittest discover -s tests -p test_native_vsf_timing.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'native HSE timing bridge contracts failed' }
+          python -B -m unittest discover -s tests -p test_native_vsf_assets.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'official pinned native cache contracts failed' }
+          python -B -m unittest discover -s tests -p test_cli_native_vsf.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'native opt-in CLI contracts failed' }
+      - name: Prepare pinned LGPL FFmpeg and ffprobe
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'pinned video codec tools unavailable' }
+      - name: Real original film frames and JA model through one-pass timed OCR
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          if (-not $env:HSE_SINTEL_STREAM_TMP) { throw 'missing scratch root' }
+          $models = Join-Path $env:HSE_SINTEL_STREAM_TMP 'models'
+          python -B tools/prepare_models.py --languages ko,en,zh --out $models *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'pinned JA PP-OCRv5 model preparation failed' }
+          python -B tools/verify_sintel_streamed_vsf_ocr.py --model-dir $models
+          if ($LASTEXITCODE -ne 0) { throw 'real filmed animation stream integration failed' }
+      - name: Erase only isolated trial environment and models
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:HSE_SINTEL_STREAM_TMP -and
+              $env:HSE_SINTEL_STREAM_TMP.StartsWith($env:RUNNER_TEMP)) {
+            Remove-Item -LiteralPath $env:HSE_SINTEL_STREAM_TMP -Recurse -Force -ErrorAction SilentlyContinue
+          }

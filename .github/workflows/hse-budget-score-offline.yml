@@ -1,0 +1,73 @@
+name: HSE offline budget score integrity contracts
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-budget-score-contract-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  score-integrity:
+    if: ${{ contains(github.event.head_commit.message, '[hse-budget-score-offline]') }}
+    runs-on: windows-2025
+    timeout-minutes: 12
+    env:
+      PYTHONPATH: "src;tools"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create temporary isolated Python
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 runner required' }
+          if (Test-Path .venv-hse-budget-score) { throw 'isolation directory preexists' }
+          python -m venv .venv-hse-budget-score
+          if ($LASTEXITCODE -ne 0) { throw 'temporary Python failed' }
+          (Resolve-Path .venv-hse-budget-score\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install synthetic-only dependencies and test strict score
+        shell: pwsh
+        run: |
+          python -m pip install "numpy>=2.0" "opencv-python-headless>=4.10" "Pillow>=10"
+          if ($LASTEXITCODE -ne 0) { throw 'basic synthetic libraries unavailable' }
+          foreach ($file in @('test_sampling_budget_report.py','test_multiline_streaming_quality_report.py','test_detector_sampling.py','test_rapidocr_subtitle_filter.py','test_raw_multiline_model_filter.py','test_quiet_cap_trial_report.py')) {
+            python -B -m unittest discover -s tests -p $file -v
+            if ($LASTEXITCODE -ne 0) { throw "offline strict export accounting failed: $file" }
+          }
+          Write-Host "HSE_BUDGET_SCORE_OFFLINE=PASS RESEARCH_ONLY=YES OCR_MODEL_DOWNLOAD=NONE"
+      - name: Remove temporary runtime
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Remove-Item .venv-hse-budget-score -Recurse -Force -ErrorAction SilentlyContinue
+
+
+  upstream-export-contract:
+    # Registered workflow path; standard-library-only and separate from
+    # existing model/budget study. No external OCR downloads or source changes.
+    if: ${{ contains(github.event.head_commit.message, '[hse-upstream-scorer-qa]') }}
+    runs-on: windows-2025
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate 23 adversarial external OCR grading contracts
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -B -m unittest discover -s tests -p test_external_engine_exports.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'offline external OCR scorer regression failed' }
+          Write-Host 'HSE_UPSTREAM_SCORER_CONTRACT=PASS NO_MODEL_DOWNLOAD=TRUE NO_MEDIA_WRITE=TRUE'

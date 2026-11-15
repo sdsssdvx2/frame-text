@@ -1,0 +1,53 @@
+name: HSE managed official yt-dlp update contracts (HOLD)
+
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+
+permissions:
+  contents: read
+
+jobs:
+  managed-official-ytdlp:
+    if: ${{ contains(github.event.head_commit.message, '[hse-managed-yt-dlp-qa]') }}
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check Windows source syntax and offline opt-in/update/rollback contracts
+        shell: pwsh
+        env:
+          PYTHONPATH: src
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'Windows x64 evidence required'
+          }
+          python -B -c "import ast,pathlib; [ast.parse(pathlib.Path(p).read_text(encoding='utf-8')) for p in ('src/hardsub_extractor/managed_caption_downloader.py','src/hardsub_extractor/gui.py','src/hardsub_extractor/selftest.py','src/hardsub_extractor/subtitle_acquisition.py','tests/test_managed_caption_downloader.py')]"
+          if ($LASTEXITCODE -ne 0) { throw 'changed Python syntax invalid' }
+          $scratch = Join-Path $env:RUNNER_TEMP ('hse-ytdlp-managed-' + $env:GITHUB_RUN_ID)
+          if (Test-Path -LiteralPath $scratch) { throw 'existing test scratch must not be replaced' }
+          python -m venv $scratch
+          if ($LASTEXITCODE -ne 0) { throw 'isolated Python environment failed' }
+          try {
+            $py = Join-Path $scratch 'Scripts/python.exe'
+            & $py -m pip install --disable-pip-version-check 'numpy==2.5.4'
+            if ($LASTEXITCODE -ne 0) { throw 'required isolated NumPy unavailable' }
+            & $py -B -m unittest discover -s tests -p test_managed_caption_downloader.py -v
+            if ($LASTEXITCODE -ne 0) { throw 'isolated official updater safety/integration failure' }
+            & $py -B -m unittest discover -s tests -p test_subtitle_acquisition.py -q
+            if ($LASTEXITCODE -ne 0) { throw 'existing original subtitle-first acquisition regressed' }
+            Write-Host 'HSE_YTDLP_MANAGED_OFFLINE_QA=PASS;EXTERNAL_RELEASE_DOWNLOAD=0;OPERATING_HSE=UNCHANGED;ACTIVATION=OFF'
+          }
+          finally {
+            if (Test-Path -LiteralPath $scratch) {
+              Remove-Item -LiteralPath $scratch -Force -Recurse -ErrorAction SilentlyContinue
+            }
+          }

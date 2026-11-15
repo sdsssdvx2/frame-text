@@ -1,0 +1,101 @@
+name: HSE Vimeo and Dailymotion subtitle-first provider integration
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-public-provider-expansion
+  cancel-in-progress: false
+
+jobs:
+  public-provider:
+    if: contains(github.event.head_commit.message, '[hse-provider-expansion]')
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create disposable provider research environment
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'Windows x64 required'
+          }
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-provider-expand-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $scratch) {
+            throw 'Provider isolation directory collision'
+          }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          python -m venv (Join-Path $scratch 'venv')
+          if ($LASTEXITCODE -ne 0) { throw 'Temporary source environment failed' }
+          (Resolve-Path (Join-Path $scratch 'venv\Scripts')).Path |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "HSE_PROVIDER_EXPAND_SCRATCH=$scratch" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install only isolated source dependencies without OCR models
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -e . *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Provider source runtime unavailable' }
+      - name: Run changed-site contract and neighboring regression suites
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $suites = @(
+            'test_public_provider_expansion.py',
+            'test_subtitle_acquisition.py',
+            'test_subtitle_proxy.py',
+            'test_public_video_ocr.py',
+            'test_subtitle_batch_cli.py',
+            'test_public_caption_probe.py',
+            'test_gui_public_captions.py'
+          )
+          foreach ($suite in $suites) {
+            Write-Host "HSE_PROVIDER_SUITE=$suite"
+            python -B -m unittest discover -s tests -p $suite -v
+            if ($LASTEXITCODE -ne 0) { throw "Provider regression failed: $suite" }
+          }
+          Write-Host 'HSE_PROVIDER_OFFLINE_CONTRACTS=PASS;USER_DATA_CHANGED=NO'
+      - name: Prepare independently hash-pinned official yt-dlp binary
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_yt_dlp_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned public caption downloader unavailable' }
+      - name: Live public Vimeo caption to original VTT plus SRT ASS
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $report = Join-Path $env:HSE_PROVIDER_EXPAND_SCRATCH 'vimeo.json'
+          python -B tools/hse_public_caption_probe.py --url 'https://vimeo.com/76979871' --languages en --yt-dlp 'bin/yt-dlp.exe' --max-seconds 180 --report $report --require-download
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host 'HSE_VIMEO_LIVE_VALIDATED=NO;REASON=UNAVAILABLE_OR_MISSING_CAPTIONS'
+            throw 'Real Vimeo video+public caption proof absent; provider promotion remains HOLD'
+          }
+          $evidence = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
+          if ($evidence.results.Count -ne 1 -or
+              $evidence.results[0].site -ne 'vimeo' -or
+              $evidence.results[0].status -ne 'downloaded' -or
+              $evidence.results[0].files_verified -ne $true -or
+              $evidence.results[0].cue_count -le 0) {
+            throw 'Vimeo live metadata/caption/normalized-file integrity proof incomplete'
+          }
+          Write-Host 'HSE_VIMEO_LIVE_VALIDATED=YES;ACTUAL_PUBLIC_CAPTIONS=YES;RAW_AND_SRT_ASS_VERIFIED=YES'
+      - name: Delete only isolated venv and live subtitle evidence
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:HSE_PROVIDER_EXPAND_SCRATCH -and
+              $env:HSE_PROVIDER_EXPAND_SCRATCH.StartsWith($env:RUNNER_TEMP)) {
+            Remove-Item -LiteralPath $env:HSE_PROVIDER_EXPAND_SCRATCH -Recurse -Force -ErrorAction SilentlyContinue
+          }

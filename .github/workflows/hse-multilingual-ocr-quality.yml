@@ -1,0 +1,110 @@
+name: HSE multilingual OCR synthetic quality acceptance
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  actual-ocr:
+    if: ${{ contains(github.event.head_commit.message, '[hse-multilang-ocr-qa]') }}
+    runs-on: windows-2025
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create isolated Python environment
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw "Windows x64 OCR acceptance required"
+          }
+          python -m venv .venv-hse-multilang
+          if ($LASTEXITCODE -ne 0) { throw "isolated environment creation failed" }
+          (Resolve-Path .venv-hse-multilang\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install pinned actual OCR runtime
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[ocr]"
+          if ($LASTEXITCODE -ne 0) { throw "OCR dependencies could not be installed" }
+      - name: Prepare pinned FFmpeg for actual MP4 codec acceptance
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw "pinned FFmpeg preparer failed" }
+      - name: Download and SHA-verify all selected OCR models in isolation
+        shell: pwsh
+        run: |
+          $isolated = Join-Path $env:RUNNER_TEMP "hse-multilang-$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory -Path $isolated -Force | Out-Null
+          $path = Join-Path $isolated "models"
+          $env:HSE_MULTILANG_TEST_MODELS = $path
+          try {
+            python -B tools/prepare_models.py --languages ko,en,zh --out $path *> $null
+            if ($LASTEXITCODE -ne 0) { throw "Pinned OCR model verification failed" }
+            Write-Host "HSE_MULTILANG_MODELS_VERIFIED=TRUE"
+            python -B tools/verify_multilang_ocr_synthetic.py --model-dir $path --languages ko,en,ja,zh --max-cer 0.05
+            if ($LASTEXITCODE -ne 0) { throw "Multilingual OCR still-image quality acceptance failed" }
+            python -B tools/verify_multilang_video_pipeline.py --model-dir $path --languages ko,en,ja,zh --max-cer 0.0 --max-timing-error 0.65 --require-exact-text
+            if ($LASTEXITCODE -ne 0) { throw "Multilingual OCR real video pipeline quality acceptance failed" }
+            python -B tools/verify_public_video_ocr_pipeline.py --model-dir $path --languages ko,en,ja,zh
+            if ($LASTEXITCODE -ne 0) { throw "Public caption-absence to real FFmpeg video OCR fallback failed" }
+          }
+          finally {
+            Remove-Item -LiteralPath $isolated -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+  bitmap-source-ocr:
+    if: contains(github.event.head_commit.message, '[hse-bitmap-multilang-qa]')
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create isolated bitmap OCR environment
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'Pinned multilingual image OCR requires Windows x64'
+          }
+          $study = Join-Path $env:RUNNER_TEMP "hse-bitmap-multilang-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $study) { throw 'Study folder collision' }
+          New-Item -ItemType Directory -Path $study | Out-Null
+          "HSE_BITMAP_STUDY=$study" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          python -m venv (Join-Path $study 'venv')
+          if ($LASTEXITCODE -ne 0) { throw 'isolated Python unavailable' }
+          (Resolve-Path (Join-Path $study 'venv\Scripts')).Path |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install pinned PP-OCR dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -e ".[ocr]" *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'pinned OCR dependencies unavailable' }
+      - name: Measure real model recognition on isolated two-row BDN bitmap subtitles
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: "src;tools"
+        run: |
+          $models = Join-Path $env:HSE_BITMAP_STUDY 'models'
+          python -B tools/prepare_models.py --languages ko,en,zh --out $models *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'SHA-pinned OCR model verification failed' }
+          python -B tools/verify_bitmap_multilingual_quality.py --model-dir $models
+          if ($LASTEXITCODE -ne 0) { throw 'bitmap source OCR research execution failed' }
+      - name: Delete isolated study inputs and model copies
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:HSE_BITMAP_STUDY -and
+              $env:HSE_BITMAP_STUDY.StartsWith($env:RUNNER_TEMP, [StringComparison]::OrdinalIgnoreCase)) {
+            Remove-Item -LiteralPath $env:HSE_BITMAP_STUDY -Recurse -Force -ErrorAction SilentlyContinue
+          }

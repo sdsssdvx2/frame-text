@@ -1,0 +1,39 @@
+name: HSE official SeConv 5.4 live private-cache admission (HOLD)
+
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+
+permissions:
+  contents: read
+
+jobs:
+  official-seconv-user-cache:
+    if: ${{ contains(github.event.head_commit.message, '[hse-seconv54-live-loader]') }}
+    runs-on: windows-2025
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Admit official SeConv only into fresh isolated runner scratch
+        shell: pwsh
+        env:
+          PYTHONPATH: src
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 required' }
+          $scratch = Join-Path $env:RUNNER_TEMP ('hse-seconv54-private-' + $env:GITHUB_RUN_ID)
+          if (Test-Path -LiteralPath $scratch) { throw 'Existing scratch directory cannot be modified' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          try {
+            python -B tools/verify_managed_seconv_54_real.py --scratch $scratch
+            if ($LASTEXITCODE -ne 0) { throw 'Official SeConv 5.4 cache admission failed; NO PROMOTION' }
+          } finally {
+            Remove-Item -LiteralPath $scratch -Force -Recurse -ErrorAction SilentlyContinue
+          }

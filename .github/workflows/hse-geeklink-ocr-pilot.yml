@@ -1,0 +1,175 @@
+name: HSE independent pinned public-film hard-subtitle OCR pilot
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  pinned-public-ocr-pilot:
+    if: contains(github.event.head_commit.message, '[hse-geeklink-ocr-pilot]')
+    runs-on: windows-2025
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Public source manifest and image SHA preflight, no OCR dependencies
+        shell: pwsh
+        run: |
+          python -B tools/benchmark_geeklink_ocr.py --source-only --accept-public-download
+          if ($LASTEXITCODE -ne 0) { throw 'Public source pin preflight blocked; no model downloads' }
+      - name: Isolated free Python OCR bench environment
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 required' }
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-public-bench-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $scratch) { throw 'Scratch folder collision' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          "HSE_PUBLIC_BENCH_SCRATCH=$scratch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          python -m venv (Join-Path $scratch 'venv')
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated Python creation failed' }
+          (Resolve-Path (Join-Path $scratch 'venv/Scripts')).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install existing free OCR runtime and test benchmark contracts
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -m pip install --disable-pip-version-check -e ".[ocr]" *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Free OCR dependencies unavailable' }
+          python -B -m unittest discover -s tests -p test_geeklink_ocr_pilot.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Benchmark safety contracts failed' }
+      - name: Acquire SHA-verified free HSE models and 24 pinned public film images
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $models = Join-Path $env:HSE_PUBLIC_BENCH_SCRATCH 'models'
+          python -B tools/prepare_models.py --out $models --languages ko,en,zh *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Model SHA pin failed' }
+          $report = Join-Path $env:HSE_PUBLIC_BENCH_SCRATCH 'aggregate-report.json'
+          python -B tools/benchmark_geeklink_ocr.py --model-dir $models --manifest models/manifest.json --out $report --accept-public-download
+          if ($LASTEXITCODE -ne 0) { throw 'External benchmark incomplete' }
+          $body = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
+          if ($body.total_images -ne 24 -or $body.watermark_images -ne 12 -or
+              $body.images_redistributed -ne $false -or $body.paid_api_calls -ne 0 -or
+              $body.quality_acceptance_claimed -ne $false -or
+              $body.scores.hse_production_roi.all.n -ne 24 -or
+              $body.scores.hse_full_frame.all.n -ne 24 -or
+              $body.scores.geeklink_public_onnx_raw.all.n -ne 24) {
+            throw 'Incomplete or misleading independent OCR evidence'
+          }
+          # Actions artifact quota may be exhausted. Persist only safe
+          # aggregate metrics in normal job logs and GITHUB_STEP_SUMMARY;
+          # never upload copyrighted frames, report ZIPs, or OCR text.
+          $lines = @(
+            '### HSE public-film subtitle OCR (research only)'
+            '24 images, 12 with synthetic watermark; no natural-video claim'
+            '| OCR route | All CER | Clean CER | Watermark CER |'
+            '|---|---:|---:|---:|'
+          )
+          foreach ($key in @('hse_production_roi','hse_full_frame','geeklink_public_onnx_raw')) {
+            $m = $body.scores.$key
+            $lines += ('| ' + $key + ' | ' + $m.all.cer + ' | ' + $m.clean.cer + ' | ' + $m.watermark.cer + ' |')
+          }
+          $lines += 'Pinned data: GeekLinkDev/geeklink-ocr-benchmark, mixed image licenses; aggregate only'
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          Write-Host 'HSE_PUBLIC_OCR_PILOT=MEASURED;IMAGES=24;WATERMARK=12;NO_IMAGE_REDIStribution=TRUE'
+      - name: Remove OCR model and frame test scratch
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:HSE_PUBLIC_BENCH_SCRATCH -and
+              $env:HSE_PUBLIC_BENCH_SCRATCH.StartsWith($env:RUNNER_TEMP, [StringComparison]::OrdinalIgnoreCase)) {
+            Remove-Item -LiteralPath $env:HSE_PUBLIC_BENCH_SCRATCH -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+  pinned-spatial-crop-ab:
+    if: contains(github.event.head_commit.message, '[hse-geeklink-spatial-ab]')
+    runs-on: windows-2025
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify spatial A/B contracts without model or external requests
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -B -m unittest discover -s tests -p test_geeklink_spatial_ab.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Spatial comparison safety contracts failed' }
+      - name: Prepare isolated free OCR runtime
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'Windows 64-bit required'
+          }
+          $root = Join-Path $env:RUNNER_TEMP "hse-spatial-ab-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $root) { throw 'Temporary root collision' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          "HSE_SPATIAL_AB_SCRATCH=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          python -m venv (Join-Path $root 'venv')
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated venv unavailable' }
+          (Resolve-Path (Join-Path $root 'venv/Scripts')).Path |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install existing free model dependencies only
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -e ".[ocr]" *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'Existing free OCR runtime unavailable' }
+      - name: Run SHA-verified, equal-sample cropping A/B without raw image upload
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $models = Join-Path $env:HSE_SPATIAL_AB_SCRATCH 'models'
+          python -B tools/prepare_models.py --out $models --languages ko,en,zh *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'SHA pinned OCR assets unavailable' }
+          $report = Join-Path $env:HSE_SPATIAL_AB_SCRATCH 'aggregate.json'
+          python -B tools/benchmark_geeklink_spatial_ab.py --model-dir $models --model-manifest models/manifest.json --report $report --accept-public-download
+          if ($LASTEXITCODE -ne 0) { throw 'Spatial A/B benchmark failed' }
+          $body = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
+          if ($body.sample_count -ne 24 -or $body.watermark_samples -ne 12 -or
+              $body.quality_improvement_verified -ne $false -or
+              $body.no_model_or_release_change -ne $true -or
+              $body.no_image_redistribution -ne $true -or
+              $body.paid_calls -ne 0 -or
+              $body.cer.production_roi.all.n -ne 24 -or
+              $body.cer.center_bottom_32.clean.n -ne 12 -or
+              $body.cer.center_bottom_26.watermark.n -ne 12) {
+            throw 'Incomplete crop research evidence'
+          }
+          $table = @(
+            '### HSE pinned OCR spatial crop A/B (24 public synthetic-on-film images)'
+            'Do NOT interpret as natural subtitle or deployable improvement'
+            '| Crop | All CER | Clean CER | Watermark CER | Clean worsened images |'
+            '|---|---:|---:|---:|---:|'
+          )
+          foreach ($name in @('production_roi','center_bottom_32','center_bottom_26')) {
+            $s = $body.cer.$name
+            $harm = 0
+            if ($name -ne 'production_roi') {
+              $harm = $body.pairwise_errors_vs_production.$name.clean.worsened
+            }
+            $table += ('| ' + $name + ' | ' + $s.all.cer + ' | ' +
+                       $s.clean.cer + ' | ' + $s.watermark.cer + ' | ' + $harm + ' |')
+          }
+          $table | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          Write-Host 'HSE_SPATIAL_AB=REAL_MODELS_VERIFIED;IMAGES=24;VARIANTS=3;PRODUCTION_CHANGED=NO'
+      - name: Delete all source images, models, aggregate and virtual environment
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:HSE_SPATIAL_AB_SCRATCH -and
+              $env:HSE_SPATIAL_AB_SCRATCH.StartsWith($env:RUNNER_TEMP, [StringComparison]::OrdinalIgnoreCase)) {
+            Remove-Item -LiteralPath $env:HSE_SPATIAL_AB_SCRATCH -Recurse -Force -ErrorAction SilentlyContinue
+          }

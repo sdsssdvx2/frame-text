@@ -1,0 +1,72 @@
+name: HSE official VSF 6.10.7 isolated side-by-side research (HOLD)
+
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+
+permissions:
+  contents: read
+
+jobs:
+  vsf-release-compatibility:
+    if: ${{ contains(github.event.head_commit.message, '[hse-vsf-side-by-side]') }}
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Isolated Python environment and offline regression
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'Native official release acceptance requires Windows x64'
+          }
+          $root = Join-Path $env:RUNNER_TEMP ('hse-vsf-versions-' + $env:GITHUB_RUN_ID)
+          if (Test-Path -LiteralPath $root) { throw 'Existing QA scratch must not be replaced' }
+          "HSE_VSF_QA_SCRATCH=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          python -m venv $root
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated Python venv unavailable' }
+          $py = Join-Path $root 'Scripts/python.exe'
+          & $py -m pip install --disable-pip-version-check -e .
+          if ($LASTEXITCODE -ne 0) { throw 'Declared free HSE Python dependencies unavailable' }
+          & $py -B -m unittest discover -s tests -p test_native_vsf_assets.py -q
+          if ($LASTEXITCODE -ne 0) { throw 'Existing pinned VSF baseline regressed' }
+          & $py -B -m unittest discover -s tests -p test_native_vsf_release_versions.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Side-by-side official version pin/rollback failed' }
+          & $py -B -m unittest discover -s tests -p test_cli_native_vsf.py -q
+          if ($LASTEXITCODE -ne 0) { throw 'Existing optional CLI/soft-first contract regressed' }
+          & $py -B -m unittest discover -s tests -p test_gui_diagnostic_privacy.py -q
+          if ($LASTEXITCODE -ne 0) { throw 'GUI default opt-in privacy contract regressed' }
+          Write-Host 'HSE_VSF_VERSION_OFFLINE_CONTRACTS=PASS;MODEL_CALLS=0;USER_VIDEO_READ=NO'
+      - name: Prepare official pinned video codec, no user media
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned FFmpeg unavailable' }
+      - name: Real pinned official VSF 6.10.5 vs 6.10.7 on identical source and blank MP4s
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $py = Join-Path $env:HSE_VSF_QA_SCRATCH 'Scripts/python.exe'
+          & $py -B tools/verify_vsf_6107_side_by_side.py
+          if ($LASTEXITCODE -ne 0) { throw 'Native candidate A/B incomplete; NO PROMOTION' }
+      - name: Remove only own isolated Python scratch
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $root = $env:HSE_VSF_QA_SCRATCH
+          if ($root -and (Test-Path -LiteralPath $root)) {
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+          }

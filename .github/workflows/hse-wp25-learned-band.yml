@@ -1,0 +1,77 @@
+name: HSE WP25 learned-band oversized-only fallback probe (research HOLD)
+
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-wp25-learned-band-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  learned-band:
+    if: ${{ contains(github.event.head_commit.message, '[hse-wp25-learned-band]') || contains(github.event.head_commit.message, '[hse-wp25-targeted-recovery]') || contains(github.event.head_commit.message, '[hse-wp25-robust-band]') }}
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run one bounded two-pass learned-band probe on publisher WP25
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+          HSE_TARGETED_RECOVERY: ${{ contains(github.event.head_commit.message, '[hse-wp25-targeted-recovery]') }}
+          HSE_ROBUST_BAND: ${{ contains(github.event.head_commit.message, '[hse-wp25-robust-band]') }}
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'Windows x64 only'
+          }
+          $root=Join-Path $env:RUNNER_TEMP "hse-wp25-learned-band-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $root) { throw 'owned scratch collision' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          try {
+            $venv=Join-Path $root 'venv'
+            python -m venv $venv
+            if ($LASTEXITCODE -ne 0) { throw 'isolated Python failed' }
+            $py=Join-Path $venv 'Scripts\python.exe'
+            & $py -m pip install --disable-pip-version-check -e '.[ocr,accelerated]' *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'pinned free OCR/OpenVINO runtime unavailable' }
+            $models=Join-Path $root 'models'
+            & $py -B tools/prepare_models.py --languages en --out $models *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'pinned English OCR model unavailable' }
+            $bin=Join-Path $root 'bin'
+            pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1 -Destination $bin
+            if ($LASTEXITCODE -ne 0) { throw 'pinned FFmpeg unavailable' }
+            $env:HSE_FFMPEG=Join-Path $bin 'ffmpeg.exe'
+            $env:HSE_FFPROBE=Join-Path $bin 'ffprobe.exe'
+            if ($env:HSE_ROBUST_BAND -eq 'true') {
+              & $py -B tools/probe_wp25_robust_band.py --scratch (Join-Path $root 'media') --model-dir $models --manifest (Join-Path $env:GITHUB_WORKSPACE 'models/manifest.json') --approve-public-sources
+              if ($LASTEXITCODE -ne 0) { throw 'WP25 robust-band probe incomplete; no retry' }
+              Write-Host 'HSE_WP25_ROBUST_BAND=MEASURED;CLEAN_PAIR_INFERENCE=NO;ORIGINAL_OUTPUT_PRESERVED=YES;RELEASE=HOLD'
+              return
+            }
+            if ($env:HSE_TARGETED_RECOVERY -eq 'true') {
+              & $py -B tools/probe_wp25_targeted_recovery.py --scratch (Join-Path $root 'media') --model-dir $models --manifest (Join-Path $env:GITHUB_WORKSPACE 'models/manifest.json') --approve-public-source
+              if ($LASTEXITCODE -ne 0) { throw 'WP25 targeted recovery probe incomplete; no retry' }
+              Write-Host 'HSE_WP25_TARGETED_RECOVERY=MEASURED;ORIGINAL_OUTPUT_PRESERVED=YES;RELEASE=HOLD'
+              return
+            }
+            & $py -B tools/probe_wp25_learned_band.py --scratch (Join-Path $root 'media') --model-dir $models --manifest (Join-Path $env:GITHUB_WORKSPACE 'models/manifest.json') --approve-public-source
+            if ($LASTEXITCODE -ne 0) { throw 'WP25 learned-band probe incomplete; no retry' }
+            Write-Host 'HSE_WP25_LEARNED_BAND=MEASURED;PRODUCTION_CHANGE=NO;RELEASE=HOLD'
+          }
+          finally {
+            if (Test-Path -LiteralPath $root) {
+              Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }

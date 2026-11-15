@@ -1,0 +1,96 @@
+name: HSE second independent natural publisher subtitle A/B (HOLD)
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+permissions:
+  contents: read
+jobs:
+  second-natural-publisher:
+    if: ${{ contains(github.event.head_commit.message, '[hse-second-natural]') || contains(github.event.head_commit.message, '[hse-second-native]') || contains(github.event.head_commit.message, '[hse-second-cap]') || contains(github.event.head_commit.message, '[hse-second-geometry]') || contains(github.event.head_commit.message, '[hse-second-bottom25]') || contains(github.event.head_commit.message, '[hse-second-caption-band]') || contains(github.event.head_commit.message, '[hse-second-light-islands]') || contains(github.event.head_commit.message, '[hse-second-openvino]') }}
+    runs-on: windows-2025
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Pin original Wikimedia videos and independent reference in disposable Windows scratch
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          HSE_NATIVE_RESOLUTION: ${{ contains(github.event.head_commit.message, '[hse-second-native]') }}
+          HSE_RESEARCH_QUIET_CAP: ${{ contains(github.event.head_commit.message, '[hse-second-cap]') }}
+          HSE_GEOMETRY_ONLY: ${{ contains(github.event.head_commit.message, '[hse-second-geometry]') }}
+          HSE_BOTTOM25: ${{ contains(github.event.head_commit.message, '[hse-second-bottom25]') }}
+          HSE_CAPTION_BAND: ${{ contains(github.event.head_commit.message, '[hse-second-caption-band]') }}
+          HSE_LIGHT_ISLANDS: ${{ contains(github.event.head_commit.message, '[hse-second-light-islands]') }}
+          HSE_OPENVINO_STUDY: ${{ contains(github.event.head_commit.message, '[hse-second-openvino]') }}
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 only' }
+          $root=Join-Path $env:RUNNER_TEMP "hse-second-natural-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $root) { throw 'isolated scratch collision' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          try {
+            $venv=Join-Path $root 'venv'
+            python -m venv $venv
+            if ($LASTEXITCODE -ne 0) { throw 'no isolated Python' }
+            $py=Join-Path $venv 'Scripts\python.exe'
+            & $py -m pip install --disable-pip-version-check -e '.[ocr]' *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'declared free OCR dependencies unavailable' }
+            $bin=Join-Path $root 'bin'
+            & (Join-Path $env:GITHUB_WORKSPACE 'tools/prepare_ffmpeg_ci.ps1') -Destination $bin
+            if ($LASTEXITCODE -ne 0) { throw 'official FFmpeg missing' }
+            $env:HSE_FFMPEG=Join-Path $bin 'ffmpeg.exe'
+            $env:HSE_FFPROBE=Join-Path $bin 'ffprobe.exe'
+            $env:PYTHONPATH="$env:GITHUB_WORKSPACE\src;$env:GITHUB_WORKSPACE\tools"
+            $env:TEMP=$root
+            $env:TMP=$root
+            & $py -B tools/verify_wikimedia_second_natural_ocr.py --approve-public-sources --reference-only
+            if ($LASTEXITCODE -ne 0) { throw 'independent publisher revision pin invalid' }
+            if ($env:HSE_GEOMETRY_ONLY -eq 'true') {
+              & $py -B tools/verify_wikimedia_second_natural_ocr.py --approve-public-sources --geometry-only
+              if ($LASTEXITCODE -ne 0) { throw 'independent publisher geometry study incomplete; no retry' }
+              Write-Host 'HSE_SECOND_PUBLISHER_GEOMETRY=DONE;MODEL_CALLS=0;RELEASE=HOLD'
+            }
+            else {
+              $models=Join-Path $root 'models'
+              & $py -B tools/prepare_models.py --languages en --out $models *> $null
+              if ($LASTEXITCODE -ne 0) { throw 'free SHA-pinned English model unavailable' }
+              if ($env:HSE_OPENVINO_STUDY -eq 'true') {
+                & $py -m pip install --disable-pip-version-check 'openvino==2026.4.1' *> $null
+                if ($LASTEXITCODE -ne 0) { throw 'exact free OpenVINO runtime unavailable' }
+                & $py -B -m unittest discover -s tests -p test_rapidocr_thread_options.py -q
+                if ($LASTEXITCODE -ne 0) { throw 'backend selection contract failed' }
+                & $py -B tools/compare_openvino_second_natural.py --approve-public-sources --model-dir $models --manifest (Join-Path $env:GITHUB_WORKSPACE 'models/manifest.json')
+                if ($LASTEXITCODE -ne 0) { throw 'natural publisher OpenVINO comparison failed; no retry' }
+                Write-Host 'HSE_SECOND_OPENVINO=MEASURED;DEFAULT_INERT=YES;RELEASE=HOLD'
+                return
+              }
+              $resolutionFlags = @()
+              if ($env:HSE_NATIVE_RESOLUTION -eq 'true') { $resolutionFlags = @('--native-resolution') }
+              $capFlags = @()
+              if ($env:HSE_RESEARCH_QUIET_CAP -eq 'true') { $capFlags = @('--research-quiet-cap-seconds','1.5') }
+              $roiFlags = @()
+              if ($env:HSE_BOTTOM25 -eq 'true') { $roiFlags = @('--research-region','bottom25') }
+              $detectorFlags = @()
+              if ($env:HSE_CAPTION_BAND -eq 'true') { $detectorFlags = @('--research-signature-mode','caption_band_white_3') }
+              & $py -B -m unittest discover -s tests -p test_detector_sampling.py -q
+              if ($LASTEXITCODE -ne 0) { throw 'bounded detector contracts failed' }
+              & $py -B -m unittest discover -s tests -p test_caption_islands.py -q
+              if ($LASTEXITCODE -ne 0) { throw 'bounded detection sampling regression' }
+              $filterFlags = @()
+              if ($env:HSE_LIGHT_ISLANDS -eq 'true') { $filterFlags = @('--research-ocr-mode','light-island-temporal') }
+              & $py -B tools/verify_wikimedia_second_natural_ocr.py --approve-public-sources --model-dir $models --manifest (Join-Path $env:GITHUB_WORKSPACE 'models/manifest.json') @resolutionFlags @capFlags @roiFlags @detectorFlags @filterFlags
+              if ($LASTEXITCODE -ne 0) { throw 'second natural A/B incomplete; no automatic retry' }
+              Write-Host 'HSE_SECOND_NATURAL=MEASURED;INDEPENDENT_REFERENCE=YES;DEFAULT=UNCHANGED;RELEASE=HOLD'
+            }
+          }
+          finally {
+            if (Test-Path -LiteralPath $root) {
+              Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }

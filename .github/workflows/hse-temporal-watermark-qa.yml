@@ -1,0 +1,77 @@
+name: HSE actual temporal watermark versus hard-subtitle video study
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-temporal-watermark
+  cancel-in-progress: false
+
+jobs:
+  paired-video:
+    if: contains(github.event.head_commit.message, '[hse-temporal-watermark]')
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create disposable Windows OCR research environment
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 required' }
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-temporal-watermark-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $scratch) { throw 'temporary research path collision' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          $venv = Join-Path $scratch 'venv'
+          python -m venv $venv
+          if ($LASTEXITCODE -ne 0) { throw 'research venv creation failed' }
+          (Resolve-Path (Join-Path $venv 'Scripts')).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "HSE_WATERMARK_SCRATCH=$scratch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install HSE OCR runtime only in the disposable environment
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -e ".[ocr]" *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'actual OCR dependencies unavailable' }
+      - name: Run watermark controls and independent SRT scorer regressions
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -B -m unittest discover -s tests -p test_temporal_watermark_video_ocr.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'watermark study contracts failed' }
+          python -B -m unittest discover -s tests -p test_temporal_overlay_quarantine.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'conservative quarantine regressions failed' }
+          python -B -m unittest discover -s tests -p test_external_engine_exports.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'independent timed SRT scorer contracts failed' }
+      - name: Prepare SHA-pinned LGPL FFmpeg/FFprobe
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'verified source decoder/encoder unavailable' }
+      - name: Execute six paired MP4s through unchanged production detector and real OCR
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $models = Join-Path $env:HSE_WATERMARK_SCRATCH 'models'
+          python -B tools/prepare_models.py --languages ko,zh --out $models *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'SHA-pinned OCR model verification failed' }
+          python -B tools/verify_temporal_watermark_video_ocr.py --model-dir $models --languages ko,zh
+          if ($LASTEXITCODE -ne 0) { throw 'actual paired-video OCR measurements failed' }
+      - name: Remove temporary research venv, model files and video scratch
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:HSE_WATERMARK_SCRATCH -and
+              $env:HSE_WATERMARK_SCRATCH.StartsWith($env:RUNNER_TEMP)) {
+            Remove-Item -LiteralPath $env:HSE_WATERMARK_SCRATCH -Recurse -Force -ErrorAction SilentlyContinue
+          }

@@ -1,0 +1,67 @@
+name: HSE official Commons native Japanese hard-subtitles A/B (HOLD)
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+permissions:
+  contents: read
+jobs:
+  natural-japanese-source:
+    if: ${{ contains(github.event.head_commit.message, '[hse-commons-native-ja]') || contains(github.event.head_commit.message, '[hse-commons-ja-watermark]') || contains(github.event.head_commit.message, '[hse-commons-ja-bottom-two]') || contains(github.event.head_commit.message, '[hse-real-ja-light-temporal]') || contains(github.event.head_commit.message, '[hse-real-ja-pixel-only]') }}
+    runs-on: windows-2025
+    timeout-minutes: 28
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run free PP-OCRv5 on genuine licensed Japanese source without outputting media
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          HSE_KNOWN_LOGO_TRIAL: ${{ contains(github.event.head_commit.message, '[hse-commons-ja-watermark]') }}
+          HSE_LAST_TWO_TRIAL: ${{ contains(github.event.head_commit.message, '[hse-commons-ja-bottom-two]') }}
+          HSE_LIGHT_TEMPORAL_TRIAL: ${{ contains(github.event.head_commit.message, '[hse-real-ja-light-temporal]') }}
+          HSE_PIXEL_ONLY_TRIAL: ${{ contains(github.event.head_commit.message, '[hse-real-ja-pixel-only]') }}
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 required' }
+          $scratch=Join-Path $env:RUNNER_TEMP "hse-real-JA-published-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $scratch) { throw 'scratch collision' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          try {
+            python -m venv (Join-Path $scratch 'venv')
+            if ($LASTEXITCODE -ne 0) { throw 'isolated Python unavailable' }
+            $py=Join-Path $scratch 'venv\Scripts\python.exe'
+            $env:PYTHONPATH="$env:GITHUB_WORKSPACE\src;$env:GITHUB_WORKSPACE\tools"
+            $env:TMP=$scratch; $env:TEMP=$scratch
+            & $py -m pip install --disable-pip-version-check -e '.[ocr]' *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'free local OCR unavailable' }
+            & $py -B tools/verify_commons_natural_japanese.py --self-test
+            if ($LASTEXITCODE -ne 0) { throw 'source pin or study invariant failed' }
+            pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1 *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'official pinned FFmpeg unavailable' }
+            $models=Join-Path $scratch 'models'
+            & $py -B tools/prepare_models.py --languages zh --out $models --prefer-mirrors --timeout-seconds 22 --attempts 1 *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'free SHA-pinned Japanese model unavailable' }
+            $extra=@()
+            if ($env:HSE_PIXEL_ONLY_TRIAL -eq 'true') {
+              $extra=@('--pixel-timing-only')
+            } elseif ($env:HSE_LIGHT_TEMPORAL_TRIAL -eq 'true') {
+              $extra=@('--known-logo-light-temporal')
+            } elseif ($env:HSE_LAST_TWO_TRIAL -eq 'true') {
+              $extra=@('--known-logo-bottom-two')
+            } elseif ($env:HSE_KNOWN_LOGO_TRIAL -eq 'true') {
+              $extra=@('--known-logo-intervention')
+            }
+            & $py -B tools/verify_commons_natural_japanese.py --accept-public-download --model-dir $models --manifest models/manifest.json @extra
+            if ($LASTEXITCODE -ne 0) { throw 'genuine Japanese watermark A/B incomplete or unsafe' }
+            Write-Host 'HSE_REAL_JAPANESE_ORIGINAL=MEASURED;HUMAN_CER_UNAVAILABLE=YES;OPERATING_APP=UNCHANGED'
+          }
+          finally {
+            if (Test-Path -LiteralPath $scratch) {
+              Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }

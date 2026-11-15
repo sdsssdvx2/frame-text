@@ -1,0 +1,29 @@
+name: HSE offline third-party OCR export comparison contract
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-upstream-scorer-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  upstream-scorer:
+    if: ${{ contains(github.event.head_commit.message, '[hse-upstream-scorer-qa]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run independent no-network comparative safety tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -B -m unittest discover -s tests -p test_external_engine_exports.py -v

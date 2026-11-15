@@ -1,0 +1,30 @@
+name: HSE isolated multilingual OCR model integrity probe
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-upstream-assets:
+    if: ${{ contains(github.event.head_commit.message, '[hse-multilang-model-probe]') }}
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify isolated upstream ONNX and dictionary bytes
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw "requires Windows x64 isolated runner"
+          }
+          python -B tools/probe_multilang_model_assets.py
+          if ($LASTEXITCODE -ne 0) {
+            throw "official upstream multilingual OCR asset probe failed"
+          }

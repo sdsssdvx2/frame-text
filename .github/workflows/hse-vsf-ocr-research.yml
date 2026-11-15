@@ -1,0 +1,79 @@
+name: HSE VSF plus PP-OCRv5/v6 real CJK subtitle comparative QA
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-vsf-ocr-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  vsf-plus-ocr:
+    if: ${{ contains(github.event.head_commit.message, '[hse-vsf-combo-qa]') }}
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create unique offline research environment
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'native Windows x64 runtime required'
+          }
+          if (Test-Path .venv-hse-vsf-ocr) { throw 'isolation collision' }
+          python -m venv .venv-hse-vsf-ocr
+          if ($LASTEXITCODE -ne 0) { throw 'research venv creation failed' }
+          (Resolve-Path .venv-hse-vsf-ocr\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install isolated pinned HSE OCR runtime and run source contracts
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -m pip install -e ".[ocr]"
+          if ($LASTEXITCODE -ne 0) { throw 'isolated OCR dependencies failed' }
+          python -B -m unittest discover -s tests -p test_vsf_hse_combined_research.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'combined OCR research contracts failed' }
+          python -B -m unittest discover -s tests -p test_vsf_timing_research.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'native VSF release safety contracts failed' }
+          python -B -m unittest discover -s tests -p test_v6_cjk_research_integrity.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'official model SHA research integrity failed' }
+          python -B -m unittest discover -s tests -p test_external_engine_exports.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'subtitle result scoring integrity failed' }
+      - name: Get SHA-pinned LGPL FFmpeg, no system installer
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'pinned video codec provenance failed' }
+      - name: Compare native VSF gated v5/v6 and guarded HSE with one reference and paired blanks
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-vsf-rec-$env:GITHUB_RUN_ID"
+          if (Test-Path $scratch) { throw 'model sandbox collision' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          try {
+            $models = Join-Path $scratch 'model-reference'
+            python -B tools/prepare_models.py --languages ko,en,zh --out $models *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'pinned v5 OCR files could not be verified' }
+            python -B tools/compare_vsf_hse_ocr_research.py --model-dir $models
+            if ($LASTEXITCODE -ne 0) { throw 'source-matched real v5/v6 VSF OCR research incomplete' }
+          }
+          finally {
+            Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Destroy isolated temporary OCR venv
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Remove-Item .venv-hse-vsf-ocr -Recurse -Force -ErrorAction SilentlyContinue

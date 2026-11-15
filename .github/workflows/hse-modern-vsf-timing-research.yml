@@ -1,0 +1,63 @@
+name: HSE isolated upstream VideoSubFinder CLI timing research
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-modern-vsf-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  modern-vsf-timing:
+    if: ${{ contains(github.event.head_commit.message, '[hse-modern-vsf-qa]') }}
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create isolated native-research-only Python environment
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'x64 Windows required for pinned VSF official executable'
+          }
+          if (Test-Path .venv-hse-vsf) { throw 'research environment unexpectedly exists' }
+          python -m venv .venv-hse-vsf
+          if ($LASTEXITCODE -ne 0) { throw 'isolated Python venv failed' }
+          (Resolve-Path .venv-hse-vsf\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install local synthetic-fixture Python dependencies only
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -m pip install "numpy>=2.0" "opencv-python-headless>=4.10" "Pillow>=10"
+          if ($LASTEXITCODE -ne 0) { throw 'research fixtures unavailable' }
+          python -B -m unittest discover -s tests -p test_vsf_timing_research.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'pinned native source security/score contracts failed' }
+          python -B -m unittest discover -s tests -p test_external_engine_exports.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'third-party comparator cannot safely grade files' }
+      - name: Prepare SHA-pinned standalone FFmpeg for synthetic MP4
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'verified FFmpeg unavailable' }
+      - name: Execute official SHA-verified native VideoSubFinder against original and no-caption JA/ZH clips
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -B tools/compare_vsf_timing_research.py
+          if ($LASTEXITCODE -ne 0) { throw 'real upstream native detector research incomplete' }
+      - name: Remove temporary research runtime
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Remove-Item .venv-hse-vsf -Recurse -Force -ErrorAction SilentlyContinue

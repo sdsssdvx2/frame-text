@@ -1,0 +1,55 @@
+name: HSE public caption live E2E diagnostic
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  public-captions-live:
+    if: ${{ contains(github.event.head_commit.message, '[hse-public-live]') }}
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Isolate runtime without changing Chrome, VPN, cookies or installed HSE
+        shell: pwsh
+        run: |
+          if (Test-Path .venv-hse-public-live) {
+            Remove-Item .venv-hse-public-live -Recurse -Force
+          }
+          python -m venv .venv-hse-public-live
+          (Resolve-Path .venv-hse-public-live\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install production Python dependencies in isolated environment
+        run: python -m pip install -e .
+      - name: Prepare exact SHA-pinned official subtitle downloader
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/prepare_yt_dlp_ci.ps1
+      - name: Verify Korean captions on public YouTube and Chinese captions on free WeTV
+        shell: pwsh
+        env:
+          PYTHONPATH: src
+        run: |
+          python tools/hse_public_caption_probe.py `
+            --url "https://www.youtube.com/watch?v=eIho2S0ZahI" `
+            --languages ko --yt-dlp bin/yt-dlp.exe --max-seconds 180 `
+            --report artifacts/public-youtube-korean.json
+          if ($LASTEXITCODE -ne 0) {
+            throw "YouTube public caption diagnostic structural failure"
+          }
+          python tools/hse_public_caption_probe.py `
+            --url "https://wetv.vip/en/play/cw07r5wxx43mr6i/c4101m5omvv-EP01%3A_The_Truth" `
+            --languages zh --yt-dlp bin/yt-dlp.exe --max-seconds 180 `
+            --report artifacts/public-wetv-chinese.json
+          if ($LASTEXITCODE -ne 0) {
+            throw "WeTV public caption diagnostic structural failure"
+          }
+          # Results contain only counts, requested/provided language and track origin.
+          Get-Content artifacts/public-youtube-korean.json
+          Get-Content artifacts/public-wetv-chinese.json

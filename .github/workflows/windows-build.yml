@@ -1,0 +1,767 @@
+name: Windows build
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Separate pinned source SHAs per trigger.
+  group: windows-build-${{ github.ref }}-${{ github.sha }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[hse-full-ci]') || contains(github.event.head_commit.message, '[hse-windows-build-only]') }}
+    runs-on: windows-2025
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[ocr,accelerated]"
+          python -m pip install pyinstaller
+
+      - name: Verify release notices are present
+        shell: pwsh
+        run: |
+          if (-not (Test-Path THIRD_PARTY_NOTICES.md)) {
+            throw "THIRD_PARTY_NOTICES.md is required for the Windows artifact"
+          }
+
+      - name: Prepare verified OCR models
+        run: python tools/prepare_models.py
+
+      - name: Prepare pinned FFmpeg
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+
+      - name: Stage pinned free Subtitle Edit bitmap subtitle converter
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_seconv_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Free pinned seconv portable runtime staging failed' }
+          $provenance = Get-Content artifacts/seconv-provenance.json -Raw | ConvertFrom-Json
+          if ($provenance.archive_sha256 -ne '1bcafcd5fd84d445b92d33dbfef3b95d268e5d36df34272c003d83d1f37b72f7' -or
+              -not (Test-Path bin/seconv/seconv.exe)) {
+            throw 'Pinned free portable bitmap conversion runtime not verified'
+          }
+
+      - name: Prepare pinned public caption downloader
+        shell: pwsh
+        run: pwsh -NoProfile -File tools/prepare_yt_dlp_ci.ps1
+
+      - name: Generate deterministic synthetic fixtures
+        run: |
+          python tools/make_synthetic_fixture.py
+          python tools/make_stress_fixture.py
+
+      - name: Unit and synthetic tests
+        shell: pwsh
+        env:
+          NO_PROXY: "127.0.0.1,localhost"
+          HSE_TEST_SKIP_REPORT: "artifacts/unittest-environment-skips.json"
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $log = "artifacts\unittest.log"
+          & python tools/run_unittest_suite.py *> $log
+          $testExit = $LASTEXITCODE
+          if (Test-Path $log) {
+            Write-Host "Unit-test log tail:"
+            Get-Content $log -Tail 140
+          }
+          if (Test-Path artifacts\unittest-environment-skips.json) {
+            Write-Host "Environment skip accounting:"
+            Get-Content artifacts\unittest-environment-skips.json
+          }
+          if ($testExit -ne 0) {
+            exit $testExit
+          }
+
+      - name: Real PP-OCRv5 Korean synthetic acceptance
+        run: python tools/rapidocr_acceptance.py --assert-quality
+
+      - name: Build single EXE
+        run: pyinstaller --noconfirm --clean HardSubtitleExtractor.spec
+
+      - name: Capture build runtime inventory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $ffmpegHash = (Get-FileHash bin\ffmpeg.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $ffprobeHash = (Get-FileHash bin\ffprobe.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $ytDlpHash = (Get-FileHash bin\yt-dlp.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $ytDlpProvenance = Get-Content artifacts\yt-dlp-provenance.json -Raw | ConvertFrom-Json
+          if ($ytDlpHash -ne [string]$ytDlpProvenance.sha256) { throw 'yt-dlp provenance SHA mismatch' }
+          $versions = python -c "import json,cv2,onnxruntime,sys,importlib.metadata as m; print(json.dumps({'python':sys.version.split()[0],'opencv':cv2.__version__,'rapidocr':m.version('rapidocr'),'onnxruntime':onnxruntime.__version__,'openvino':m.version('openvino'),'numpy':m.version('numpy'),'pillow':m.version('Pillow'),'pyinstaller':m.version('pyinstaller')}))"
+          $packages = $versions | ConvertFrom-Json
+          $ffmpegProvenance = Get-Content artifacts\ffmpeg-provenance.json -Raw | ConvertFrom-Json
+          [ordered]@{
+            python = $packages.python
+            ffmpeg_sha256 = $ffmpegHash
+            ffprobe_sha256 = $ffprobeHash
+            seconv_release = 'v5.3.0'
+            seconv_archive_sha256 = (Get-Content artifacts/seconv-provenance.json -Raw | ConvertFrom-Json).archive_sha256
+            seconv_executable_sha256 = (Get-FileHash bin/seconv/seconv.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            seconv_portable_free_bundle = $true
+            yt_dlp_version = [string]$ytDlpProvenance.release
+            yt_dlp_sha256 = $ytDlpHash
+            yt_dlp_provider = [string]$ytDlpProvenance.provider
+            ffmpeg_provider = $ffmpegProvenance.provider
+            ffmpeg_release_tag = $ffmpegProvenance.release_tag
+            ffmpeg_asset = $ffmpegProvenance.asset
+            ffmpeg_archive_sha256 = $ffmpegProvenance.archive_sha256
+            ffmpeg_license_variant = $ffmpegProvenance.license_variant
+            opencv = $packages.opencv
+            rapidocr = $packages.rapidocr
+            onnxruntime = $packages.onnxruntime
+            openvino = $packages.openvino
+            numpy = $packages.numpy
+            pillow = $packages.pillow
+            pyinstaller = $packages.pyinstaller
+          } | ConvertTo-Json | Set-Content -Encoding UTF8 artifacts\runtime-build-inventory.json
+
+      - name: Smoke-check EXE and frozen runtime
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist\HardSubtitleExtractor.exe)) {
+            throw "HardSubtitleExtractor.exe was not built"
+          }
+          Get-FileHash dist\HardSubtitleExtractor.exe -Algorithm SHA256
+
+          $resultPath = "artifacts\frozen-selftest.json"
+          $progressPath = "artifacts\frozen-selftest-progress.jsonl"
+          $proc = Start-Process -FilePath dist\HardSubtitleExtractor.exe -ArgumentList @(
+            "--self-test",
+            "--self-test-json", $resultPath,
+            "--self-test-progress", $progressPath
+          ) -PassThru
+          $deadline = (Get-Date).AddMinutes(5)
+          while (-not $proc.HasExited) {
+            if ((Get-Date) -ge $deadline) {
+              if (Test-Path $progressPath) {
+                Write-Host "Frozen self-test progress before timeout:"
+                Get-Content $progressPath
+              }
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              throw "Frozen EXE self-test timed out after 5 minutes"
+            }
+            Start-Sleep -Seconds 5
+            $proc.Refresh()
+          }
+
+          if (Test-Path $progressPath) {
+            Write-Host "Frozen self-test progress:"
+            Get-Content $progressPath
+          }
+          if ($proc.ExitCode -ne 0) {
+            Get-Content $resultPath -ErrorAction SilentlyContinue
+            throw "Frozen EXE self-test failed with exit code $($proc.ExitCode)"
+          }
+          if (-not (Test-Path $resultPath)) {
+            throw "Frozen EXE exited successfully without producing self-test JSON"
+          }
+          Get-Content $resultPath
+
+      - name: Verify synthetic original-frame review inside the built EXE
+        if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[hse-frozen-review]') }}
+        shell: pwsh
+        run: |
+          $reportPath = "artifacts/frozen-frame-review.json"
+          if (Test-Path -LiteralPath $reportPath) { throw 'review report already exists' }
+          $proc = Start-Process -FilePath dist/HardSubtitleExtractor.exe -ArgumentList @(
+            "--frozen-frame-review-acceptance", "--review-acceptance-report", $reportPath
+          ) -PassThru
+          $limit = (Get-Date).AddMinutes(3)
+          while (-not $proc.HasExited) {
+            if ((Get-Date) -ge $limit) {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              throw 'Frozen GUI review exceeded bounded deadline'
+            }
+            Start-Sleep -Seconds 2
+            $proc.Refresh()
+          }
+          if (-not (Test-Path -LiteralPath $reportPath)) {
+            throw 'frozen review acceptance report absent'
+          }
+          $data = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+          if ($proc.ExitCode -ne 0 -or $data.ok -ne $true -or
+              $data.is_frozen -ne $true -or
+              $data.type -ne 'frozen_frame_review_acceptance' -or
+              $data.gui_worker_invoked -ne $true -or
+              $data.flagged_cues -ne 1 -or
+              $data.resumed_cues -ne 2 -or
+              $data.jpeg_frames_verified -ne 6 -or
+              $data.contact_sheets_verified -ne 2 -or
+              $data.private_offline_html_reports_verified -ne 2 -or
+              $data.trusted_windows_notepad_present -ne $true -or
+              $data.notepad_process_started -ne $false -or
+              $data.proofread_source_validated_without_editing -ne $true -or
+              $data.originals_unchanged -ne $true -or
+              $data.existing_evidence_preserved -ne $true -or
+              $data.temporary_inputs_removed -ne $true -or
+              $data.network_requests -ne 0 -or $data.frame_uploads -ne 0) {
+            Write-Host "HSE_FROZEN_REVIEW_DIAG status=$($data.ok) error=$($data.failure_type)"
+            throw 'frozen review product acceptance failed'
+          }
+          Write-Host 'HSE_FROZEN_REVIEW_PASS=TRUE;GUI_WORKER=TRUE;JPEG=6;SOURCE_UNCHANGED=YES'
+
+      - name: Verify real multilingual OCR on encoded MP4 inside the frozen EXE
+        if: ${{ github.event_name == 'push' && (contains(github.event.head_commit.message, '[hse-frozen-multilang]') || contains(github.event.head_commit.message, '[hse-frozen-openvino]')) }}
+        shell: pwsh
+        env:
+          HSE_FROZEN_OPENVINO: ${{ contains(github.event.head_commit.message, '[hse-frozen-openvino]') }}
+        run: |
+          # The fixture generator uses source Python ONLY to create videos.
+          # Detection, OCR, timestamps and SRT/ASS run entirely inside EXE.
+          # Never use the user's videos, installed HSE, browser, or VPN.
+          $fixtures = "artifacts/frozen-multilang-fixtures"
+          $reportPath = "artifacts/frozen-multilang-ocr.json"
+          if (Test-Path $fixtures) { throw "refuse to overwrite an existing fixture directory" }
+          try {
+            python -B tools/prepare_frozen_multilingual_video_fixtures.py --out $fixtures
+            if ($LASTEXITCODE -ne 0) {
+              throw "bounded synthetic MP4 creation failed"
+            }
+            $proc = Start-Process -FilePath dist\HardSubtitleExtractor.exe -ArgumentList @(
+              '--multilingual-ocr-acceptance',
+              '--ocr-fixture-dir', $fixtures,
+              '--ocr-acceptance-report', $reportPath
+            ) -PassThru
+            $deadline = (Get-Date).AddMinutes(9)
+            while (-not $proc.HasExited) {
+              if ((Get-Date) -ge $deadline) {
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                throw "frozen multilingual video OCR exceeded hard deadline"
+              }
+              Start-Sleep -Seconds 4
+              $proc.Refresh()
+            }
+            if (Test-Path $reportPath) {
+              $data = Get-Content $reportPath -Raw | ConvertFrom-Json
+              # The report is intentionally privacy-preserving; it contains no
+              # extracted text, video filenames or privileged local paths.
+              Write-Host "HSE_FROZEN_MULTILANG_DIAG ok=$($data.ok) frozen=$($data.is_frozen) exact=$($data.original_text_exact_total) cases=$(@($data.languages).Count) failure=$($data.failure_type)"
+            }
+            if ($proc.ExitCode -ne 0 -or -not (Test-Path $reportPath)) {
+              throw "real video OCR inside frozen EXE failed"
+            }
+            $data = Get-Content $reportPath -Raw | ConvertFrom-Json
+            if ($data.type -ne "frozen_multilingual_ocr_video_acceptance" -or
+                $data.schema -ne 1 -or $data.ok -ne $true -or
+                $data.is_frozen -ne $true -or
+                $data.no_external_requests -ne $true -or
+                $data.temporary_outputs_removed -ne $true -or
+                $data.original_text_exact_total -ne 8 -or
+                @($data.languages).Count -ne 4) {
+              throw "frozen multilingual OCR report invariant failed"
+            }
+            foreach ($lang in @('ko','en','ja','zh')) {
+              $rows = @($data.languages | Where-Object { $_.language -eq $lang })
+              if ($rows.Count -ne 1 -or $rows[0].original_text_exact_cues -ne 2 -or
+                  $rows[0].verified_model -ne $true -or
+                  $rows[0].real_ffmpeg_video_frames -ne $true -or
+                  $rows[0].srt_ass_verified -ne $true -or
+                  [double]$rows[0].max_timing_error_seconds -gt 0.65 -or
+                  [double]$rows[0].max_srt_ass_timing_delta_seconds -gt 0.02) {
+                throw "frozen source-language OCR verification failed for $lang"
+              }
+            }
+            Write-Host "HSE_FROZEN_MULTILANG_VIDEO_PASS=TRUE LANGUAGES=ko,en,ja,zh EXACT_CUES=8"
+            if ($env:HSE_FROZEN_OPENVINO -eq 'true') {
+              $openvinoReport = "artifacts/frozen-multilang-openvino.json"
+              if (Test-Path $openvinoReport) { throw "refuse to overwrite OpenVINO frozen report" }
+              $fast = Start-Process -FilePath dist\HardSubtitleExtractor.exe -ArgumentList @(
+                '--multilingual-ocr-acceptance',
+                '--ocr-fixture-dir', $fixtures,
+                '--ocr-acceptance-report', $openvinoReport,
+                '--ocr-acceptance-backend', 'openvino'
+              ) -PassThru
+              $fastDeadline = (Get-Date).AddMinutes(9)
+              while (-not $fast.HasExited) {
+                if ((Get-Date) -ge $fastDeadline) {
+                  Stop-Process -Id $fast.Id -Force -ErrorAction SilentlyContinue
+                  throw "frozen OpenVINO multilingual OCR exceeded hard deadline"
+                }
+                Start-Sleep -Seconds 4
+                $fast.Refresh()
+              }
+              if ($fast.ExitCode -ne 0 -or -not (Test-Path $openvinoReport)) {
+                throw "frozen OpenVINO OCR failed"
+              }
+              $fastData = Get-Content $openvinoReport -Raw | ConvertFrom-Json
+              if ($fastData.ok -ne $true -or $fastData.is_frozen -ne $true -or
+                  $fastData.inference_engine -ne 'openvino' -or
+                  $fastData.original_text_exact_total -ne 8 -or
+                  @($fastData.languages).Count -ne 4) {
+                throw "frozen OpenVINO multilingual report invariant failed"
+              }
+              foreach ($lang in @('ko','en','ja','zh')) {
+                $rows = @($fastData.languages | Where-Object { $_.language -eq $lang })
+                if ($rows.Count -ne 1 -or
+                    $rows[0].inference_engine -ne 'openvino' -or
+                    $rows[0].original_text_exact_cues -ne 2 -or
+                    $rows[0].srt_ass_verified -ne $true -or
+                    [double]$rows[0].max_timing_error_seconds -gt 0.65 -or
+                    [double]$rows[0].max_srt_ass_timing_delta_seconds -gt 0.02) {
+                  throw "frozen OpenVINO source-language OCR failed for $lang"
+                }
+              }
+              Write-Host "HSE_FROZEN_OPENVINO_PASS=TRUE LANGUAGES=ko,en,ja,zh EXACT_CUES=8"
+            }
+          }
+          finally {
+            # Do not leave test MP4s on the runner.
+            Remove-Item -LiteralPath $fixtures -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Verify frozen caption-absent public video OCR with genuine MP4
+        if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[hse-frozen-public-fallback]') }}
+        shell: pwsh
+        run: |
+          $fixtures = "artifacts/frozen-public-fallback-fixtures"
+          $reportPath = "artifacts/frozen-public-fallback.json"
+          if ((Test-Path $fixtures) -or (Test-Path $reportPath)) { throw "refuse to overwrite frozen public fallback fixtures" }
+          try {
+            python -B tools/prepare_frozen_multilingual_video_fixtures.py --out $fixtures
+            if ($LASTEXITCODE -ne 0) { throw "public fallback synthetic MP4 setup failed" }
+            $proc = Start-Process -FilePath dist\HardSubtitleExtractor.exe -ArgumentList @(
+              '--public-video-ocr-acceptance',
+              '--ocr-fixture-dir', $fixtures,
+              '--public-ocr-report', $reportPath
+            ) -PassThru
+            $deadline = (Get-Date).AddMinutes(10)
+            while (-not $proc.HasExited) {
+              if ((Get-Date) -ge $deadline) {
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                throw "frozen public video fallback exceeded deadline"
+              }
+              Start-Sleep -Seconds 4
+              $proc.Refresh()
+            }
+            if (-not (Test-Path $reportPath)) {
+              throw "frozen public fallback report missing"
+            }
+            $result = Get-Content $reportPath -Raw | ConvertFrom-Json
+            Write-Host "HSE_FROZEN_PUBLIC_OCR_DIAG ok=$($result.ok) frozen=$($result.is_frozen) exact=$($result.exact_total) failure=$($result.failure_type)"
+            if ($proc.ExitCode -ne 0 -or $result.schema -ne 1 -or
+                $result.type -ne "frozen_public_video_ocr_fallback_acceptance" -or
+                $result.ok -ne $true -or $result.is_frozen -ne $true -or
+                $result.transport -ne "synthetic_local_no_network" -or
+                $result.temporary_outputs_removed -ne $true -or
+                $result.raw_media_retained -ne $false -or
+                $result.exact_total -ne 8 -or @($result.languages).Count -ne 4) {
+              throw "frozen public video OCR product gate did not pass"
+            }
+            foreach ($lang in @('ko','en','ja','zh')) {
+              $rows = @($result.languages | Where-Object { $_.language -eq $lang })
+              if ($rows.Count -ne 1 -or $rows[0].exact_cues -ne 2 -or
+                  $rows[0].real_encoded_mp4_and_ocr -ne $true -or
+                  $rows[0].single_video_transfer -ne $true -or
+                  $rows[0].temporary_video_removed -ne $true -or
+                  $rows[0].soft_caption_preserved -ne $true -or
+                  $rows[0].read_only_visual_resume_verified -ne $true -or
+                  $rows[0].read_only_soft_resume_verified -ne $true -or
+                  [double]$rows[0].max_timeline_error_seconds -gt 0.65 -or
+                  [double]$rows[0].max_srt_ass_delta_seconds -gt 0.02) {
+                throw "frozen public video OCR source-language check failed"
+              }
+            }
+            Write-Host "HSE_FROZEN_PUBLIC_OCR_PASS=TRUE LANGUAGES=ko,en,ja,zh EXACT_CUES=8 READONLY_RESUME=ko,en,ja,zh"
+          }
+          finally {
+            Remove-Item -LiteralPath $fixtures -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Verify real local embedded subtitles inside frozen EXE
+        if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[hse-frozen-local-soft]') }}
+        shell: pwsh
+        run: |
+          # The frozen EXE generates its OWN short synthetic MKV with bundled
+          # FFmpeg, then acquires the embedded Korean and English text.
+          # The user’s original videos, installations and browser are untouched.
+          $reportPath = "artifacts/frozen-local-embedded.json"
+          if (Test-Path $reportPath) { throw "refuse to replace existing local acceptance report" }
+          $proc = Start-Process -FilePath dist\HardSubtitleExtractor.exe -ArgumentList @(
+            '--local-embedded-acceptance',
+            '--local-embedded-report', $reportPath
+          ) -PassThru
+          $deadline = (Get-Date).AddMinutes(5)
+          while (-not $proc.HasExited) {
+            if ((Get-Date) -ge $deadline) {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              throw "frozen local embedded subtitle acceptance exceeded deadline"
+            }
+            Start-Sleep -Seconds 3
+            $proc.Refresh()
+          }
+          if (-not (Test-Path $reportPath)) {
+            throw "frozen local embedded test did not report success or failure"
+          }
+          $result = Get-Content $reportPath -Raw | ConvertFrom-Json
+          Write-Host "HSE_FROZEN_LOCAL_DIAG ok=$($result.ok) frozen=$($result.is_frozen) exact=$($result.exact_cue_count) failure=$($result.failure_type)"
+          if ($proc.ExitCode -ne 0 -or
+              $result.type -ne "frozen_local_embedded_video_acceptance" -or
+              $result.schema -ne 1 -or $result.ok -ne $true -or
+              $result.is_frozen -ne $true -or
+              $result.no_external_requests -ne $true -or
+              $result.temporary_outputs_removed -ne $true -or
+              $result.wrong_language_blocked -ne $true -or
+              $result.existing_outputs_preserved -ne $true -or
+              $result.original_video_unchanged -ne $true -or
+              $result.exact_cue_count -ne 4 -or
+              @($result.languages).Count -ne 2) {
+            throw "frozen local embedded source-language or safety gate failed"
+          }
+          foreach ($lang in @('ko','en')) {
+            $rows = @($result.languages | Where-Object { $_.language -eq $lang })
+            if ($rows.Count -ne 1 -or $rows[0].exact_cue_count -ne 2 -or
+                $rows[0].srt_ass_verified -ne $true -or
+                [double]$rows[0].original_timeline_max_error_seconds -gt 0.08) {
+              throw "frozen local embedded subtitle comparison failed"
+            }
+          }
+          Write-Host "HSE_FROZEN_LOCAL_EMBEDDED_PASS=TRUE LANGUAGES=ko,en EXACT_CUES=4"
+
+      - name: Verify frozen EXE public YouTube and WeTV subtitle acquisition
+        if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[hse-frozen-public-live]') }}
+        shell: pwsh
+        run: |
+          # Never use browser profiles, local user configuration, proxy overrides
+          # or persistent subtitle files. This is an opt-in real product gate.
+          $trials = @(
+            @{ site = 'youtube'; lang = 'ko'; url = 'https://www.youtube.com/watch?v=eIho2S0ZahI' },
+            @{ site = 'wetv'; lang = 'zh'; url = 'https://wetv.vip/en/play/cw07r5wxx43mr6i/c4101m5omvv-EP01%3A_The_Truth' }
+          )
+          foreach ($trial in $trials) {
+            $reportPath = "artifacts/frozen-public-$($trial.site).json"
+            $proc = Start-Process -FilePath dist/HardSubtitleExtractor.exe -ArgumentList @(
+              '--caption-acceptance', '--caption-url', $trial.url,
+              '--caption-language', $trial.lang, '--caption-report', $reportPath
+            ) -PassThru
+            $deadline = (Get-Date).AddMinutes(4)
+            while (-not $proc.HasExited) {
+              if ((Get-Date) -ge $deadline) {
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                throw "Frozen caption check exceeded deadline for $($trial.site)"
+              }
+              Start-Sleep -Seconds 2
+              $proc.Refresh()
+            }
+            if (Test-Path $reportPath) {
+              # Capture only bounded, non-sensitive diagnostic fields even
+              # when the frozen product exits nonzero. Never print URLs,
+              # subtitle content, signed metadata or proxy endpoints.
+              $preflight = Get-Content $reportPath -Raw | ConvertFrom-Json
+              $first = @($preflight.results) | Select-Object -First 1
+              Write-Host "HSE_FROZEN_PUBLIC_DIAG site=$($trial.site) status=$($first.status) cues=$($first.cue_count) verified=$($first.files_verified) report_kind=$($preflight.type)"
+            }
+            if ($proc.ExitCode -ne 0 -or -not (Test-Path $reportPath)) {
+              throw "Frozen public caption acceptance failed for $($trial.site)"
+            }
+            $report = Get-Content $reportPath -Raw | ConvertFrom-Json
+            if ($report.results.Count -ne 1 -or
+                $report.results[0].status -ne 'downloaded' -or
+                $report.results[0].files_verified -ne $true -or
+                [int]$report.results[0].cue_count -le 0 -or
+                $report.results[0].site -ne $trial.site -or
+                $report.results[0].language -ne $trial.lang -or
+                $report.no_video_download -ne $true -or
+                $report.raw_subtitles_retained -ne $false) {
+              throw "Frozen public caption acceptance report invariant failed for $($trial.site)"
+            }
+            Write-Host "HSE_FROZEN_PUBLIC_SITE=$($trial.site) VERIFIED_CUES=$($report.results[0].cue_count)"
+            Get-Content $reportPath
+          }
+
+      - name: Verify frozen EXE browser-render product extraction on exact episode
+        # Site episode URL comes from a repository variable that only the private
+        # repository sets; the public build has no site adapter and skips this.
+        if: ${{ vars.HSE_SITE_ACCEPTANCE_URL != '' && github.event_name == 'push' && contains(github.event.head_commit.message, '[hse-frozen-live]') }}
+        shell: pwsh
+        run: |
+          $reportPath = "artifacts\frozen-browser-acceptance.json"
+          $episode = "${{ vars.HSE_SITE_ACCEPTANCE_URL }}"
+          $proc = Start-Process -FilePath dist\HardSubtitleExtractor.exe -ArgumentList @(
+            "--browser-acceptance",
+            "--browser-acceptance-url", $episode,
+            "--browser-acceptance-json", $reportPath,
+            "--browser-acceptance-start", "30",
+            "--browser-acceptance-seconds", "30"
+          ) -PassThru
+          $deadline = (Get-Date).AddMinutes(12)
+          while (-not $proc.HasExited) {
+            if ((Get-Date) -ge $deadline) {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              throw "Frozen browser-render product acceptance exceeded its hard timeout"
+            }
+            Start-Sleep -Seconds 5
+            $proc.Refresh()
+          }
+          if (-not (Test-Path $reportPath)) {
+            throw "Frozen browser acceptance did not produce its JSON report; exit=$($proc.ExitCode)"
+          }
+          Get-Content $reportPath
+          $report = Get-Content $reportPath -Raw | ConvertFrom-Json
+          if ($proc.ExitCode -ne 0 -or $report.ok -ne $true -or
+              $report.is_frozen -ne $true -or
+              $report.mode -ne "hard-ocr-browser" -or
+              [int]$report.hangul_cue_count -le 0 -or
+              $report.accuracy_verified -ne $false -or
+              $report.whole_episode_verified -ne $false) {
+            throw "Frozen EXE real browser-render product acceptance failed; exit=$($proc.ExitCode)"
+          }
+
+      - name: Capture release manifest
+        shell: pwsh
+        run: |
+          $exe = Get-Item dist\HardSubtitleExtractor.exe
+          $exeHash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $runtime = Get-Content artifacts\runtime-build-inventory.json -Raw | ConvertFrom-Json
+          $acceptance = Get-Content artifacts\rapidocr-acceptance.json -Raw | ConvertFrom-Json
+          $selftest = Get-Content artifacts\frozen-selftest.json -Raw | ConvertFrom-Json
+          $frozenMultilang = $null
+          if (Test-Path artifacts\frozen-multilang-ocr.json) {
+            $frozenMultilang = Get-Content artifacts\frozen-multilang-ocr.json -Raw | ConvertFrom-Json
+          }
+          $frozenPublicFallback = $null
+          if (Test-Path artifacts\frozen-public-fallback.json) {
+            $frozenPublicFallback = Get-Content artifacts\frozen-public-fallback.json -Raw | ConvertFrom-Json
+          }
+          $frozenLocalEmbedded = $null
+          if (Test-Path artifacts\frozen-local-embedded.json) {
+            $frozenLocalEmbedded = Get-Content artifacts\frozen-local-embedded.json -Raw | ConvertFrom-Json
+          }
+          $frozenReview = $null
+          if (Test-Path artifacts/frozen-frame-review.json) {
+            $frozenReview = Get-Content artifacts/frozen-frame-review.json -Raw | ConvertFrom-Json
+          }
+          $frozenBrowser = $null
+          if (Test-Path artifacts\frozen-browser-acceptance.json) {
+            $frozenBrowser = Get-Content artifacts\frozen-browser-acceptance.json -Raw | ConvertFrom-Json
+          }
+          $loopback = $null
+          if (Test-Path artifacts\loopback-preflight.json) {
+            $loopback = Get-Content artifacts\loopback-preflight.json -Raw | ConvertFrom-Json
+          }
+          $skipReport = $null
+          if (Test-Path artifacts\unittest-environment-skips.json) {
+            $skipReport = Get-Content artifacts\unittest-environment-skips.json -Raw | ConvertFrom-Json
+          }
+          $loopbackStatus = "not-applicable"
+          if ($null -ne $loopback) {
+            if ([bool]$loopback.ok) {
+              $loopbackStatus = "passed"
+            } else {
+              $loopbackStatus = "environment-blocked"
+            }
+          }
+          $testedSha = (git rev-parse HEAD).Trim()
+          $sourceHeadSha = "${{ github.sha }}"
+          [ordered]@{
+            tested_sha = $testedSha
+            source_head_sha = $sourceHeadSha
+            exe_name = $exe.Name
+            exe_size_bytes = $exe.Length
+            exe_sha256 = $exeHash
+            runtime = $runtime
+            seconv_portable_provenance = (Get-Content artifacts/seconv-provenance.json -Raw | ConvertFrom-Json)
+            korean_ocr_acceptance = [ordered]@{
+              cue_count_expected = $acceptance.cue_count_expected
+              cue_count_actual = $acceptance.cue_count_actual
+              average_similarity = $acceptance.average_similarity
+              minimum_cue_similarity = $acceptance.minimum_cue_similarity
+              max_start_error = $acceptance.max_start_error
+              max_end_error = $acceptance.max_end_error
+            }
+            validation = [ordered]@{
+              self_hosted_loopback_status = $loopbackStatus
+              self_hosted_loopback_preflight = $loopback
+              unittest_environment_skips = $skipReport
+            }
+            frozen_selftest_ok = [bool]$selftest.ok
+            frozen_multilingual_ocr_acceptance = $frozenMultilang
+            frozen_public_video_ocr_fallback = $frozenPublicFallback
+            frozen_local_embedded_acceptance = $frozenLocalEmbedded
+            frozen_original_frame_review_acceptance = $frozenReview
+            frozen_browser_acceptance = $frozenBrowser
+          } | ConvertTo-Json -Depth 12 | Set-Content -Encoding UTF8 artifacts\release-manifest.json
+          Get-Content artifacts\release-manifest.json
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          retention-days: 5
+          name: HardSubtitleExtractor-Windows
+          path: |
+            dist/HardSubtitleExtractor.exe
+            THIRD_PARTY_NOTICES.md
+            artifacts/rapidocr-acceptance.json
+            artifacts/frozen-selftest.json
+            artifacts/frozen-multilang-ocr.json
+            artifacts/frozen-public-fallback.json
+            artifacts/frozen-local-embedded.json
+            artifacts/frozen-frame-review.json
+            artifacts/frozen-browser-acceptance.json
+            artifacts/frozen-selftest-progress.jsonl
+            artifacts/runtime-build-inventory.json
+            artifacts/ffmpeg-provenance.json
+            artifacts/seconv-provenance.json
+            artifacts/unittest.log
+            artifacts/unittest-environment-skips.json
+            artifacts/loopback-preflight.json
+            artifacts/release-manifest.json
+
+  accept-preserved-frozen:
+    # One targeted acceptance on the already SHA-pinned Windows build.
+    # Never rebuild, install, or replace the owner application.
+    if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[hse-preserved-frozen-accept]') }}
+    runs-on: windows-2025
+    timeout-minutes: 28
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Accept the existing frozen EXE on real encoded multilingual MP4 and private review
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 required' }
+          $sourceSha = '7f465d3502afe5a26ebded1ceedeb0fa3f1c3b0b'
+          $approvedSha = '351408cd931c93cc80c7e28fb40eef99a5211f96fb534629d517931c4f276280'
+          $ownerFolder = Join-Path $env:USERPROFILE "HSE-Runner-Outputs\$sourceSha\windows-build-43395915055-attempt-1"
+          $exe = Join-Path $ownerFolder 'HardSubtitleExtractor.exe'
+          $receiptFile = Join-Path $ownerFolder 'artifacts/release-manifest.json'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf) -or -not (Test-Path -LiteralPath $receiptFile -PathType Leaf)) {
+            throw 'Approved previous EXE and receipt must exist; do not download or rebuild'
+          }
+          if ((Get-Item -LiteralPath $exe).LinkType -or (Get-Item -LiteralPath $ownerFolder).LinkType) {
+            throw 'Linked previous EXE cannot be admitted'
+          }
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $receipt = Get-Content -LiteralPath $receiptFile -Raw | ConvertFrom-Json
+          if ($hash -ne $approvedSha -or $receipt.tested_sha -ne $sourceSha -or
+              $receipt.exe_sha256 -ne $approvedSha -or $receipt.exe_size_bytes -ne 371539533 -or
+              $receipt.frozen_selftest_ok -ne $true) {
+            throw 'Exact previous frozen EXE or provenance mismatch'
+          }
+          $scratch = Join-Path $env:RUNNER_TEMP ("hse-frozen-reuse-" + $env:GITHUB_RUN_ID)
+          if (Test-Path -LiteralPath $scratch) { throw 'Never overwrite existing scratch' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          try {
+            $venv = Join-Path $scratch 'venv'
+            python -m venv $venv
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot create temporary fixture environment' }
+            $py = Join-Path $venv 'Scripts/python.exe'
+            & $py -m pip install --disable-pip-version-check --quiet 'numpy>=2.0' 'opencv-python-headless>=4.10' 'Pillow>=10'
+            if ($LASTEXITCODE -ne 0) { throw 'Free fixture dependencies unavailable' }
+            $bin = Join-Path $scratch 'bin'
+            & (Join-Path $env:GITHUB_WORKSPACE 'tools/prepare_ffmpeg_ci.ps1') -Destination $bin
+            if ($LASTEXITCODE -ne 0) { throw 'Pinned FFmpeg fixture encoder unavailable' }
+            $env:HSE_FFMPEG = Join-Path $bin 'ffmpeg.exe'
+            $env:HSE_FFPROBE = Join-Path $bin 'ffprobe.exe'
+            $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\src;$env:GITHUB_WORKSPACE\tools"
+            $fixtures = Join-Path $scratch 'fixtures'
+            & $py -B tools/prepare_frozen_multilingual_video_fixtures.py --out $fixtures
+            if ($LASTEXITCODE -ne 0) { throw 'Four independent encoded MP4 fixtures absent' }
+            # EXE must use bundled FFmpeg, not the fixture-only FFmpeg.
+            Remove-Item Env:\HSE_FFMPEG,Env:\HSE_FFPROBE -ErrorAction SilentlyContinue
+
+            function Run-Frozen([string[]]$arguments, [int]$minutes) {
+              $p = Start-Process -FilePath $exe -WorkingDirectory $scratch -ArgumentList $arguments -PassThru
+              $deadline = (Get-Date).AddMinutes($minutes)
+              while (-not $p.HasExited) {
+                if ((Get-Date) -ge $deadline) {
+                  Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+                  throw 'Frozen EXE exceeded bounded acceptance deadline'
+                }
+                Start-Sleep -Seconds 3
+                $p.Refresh()
+              }
+              if ($p.ExitCode -ne 0) { throw "Frozen EXE returned nonzero acceptance exit $($p.ExitCode)" }
+            }
+
+            $reviewPath = Join-Path $scratch 'review.json'
+            Run-Frozen @('--frozen-frame-review-acceptance','--review-acceptance-report',$reviewPath) 4
+            if (-not (Test-Path -LiteralPath $reviewPath -PathType Leaf)) { throw 'Frozen owner review report missing' }
+            $review = Get-Content -LiteralPath $reviewPath -Raw | ConvertFrom-Json
+            if ($review.ok -ne $true -or $review.is_frozen -ne $true -or
+                $review.gui_worker_invoked -ne $true -or $review.jpeg_frames_verified -ne 6 -or
+                $review.private_offline_html_reports_verified -ne 2 -or
+                $review.originals_unchanged -ne $true -or $review.network_requests -ne 0 -or
+                $review.notepad_process_started -ne $false) {
+              throw 'Frozen original-frame review acceptance failed'
+            }
+            Write-Host 'HSE_PINNED_REVIEW=PASS;ORIGINAL_JPEG=6;OFFLINE_HTML=2;USER_FILES_CHANGED=NO'
+
+            $multiPath = Join-Path $scratch 'multilang.json'
+            Run-Frozen @('--multilingual-ocr-acceptance','--ocr-fixture-dir',$fixtures,'--ocr-acceptance-report',$multiPath) 10
+            if (-not (Test-Path -LiteralPath $multiPath -PathType Leaf)) { throw 'Frozen multilingual report missing' }
+            $multi = Get-Content -LiteralPath $multiPath -Raw | ConvertFrom-Json
+            if ($multi.type -ne 'frozen_multilingual_ocr_video_acceptance' -or
+                $multi.ok -ne $true -or $multi.is_frozen -ne $true -or
+                $multi.no_external_requests -ne $true -or $multi.temporary_outputs_removed -ne $true -or
+                $multi.original_text_exact_total -ne 8 -or @($multi.languages).Count -ne 4) {
+              throw 'Frozen four-language real-MP4 OCR was not accepted'
+            }
+            foreach ($lang in @('ko','en','ja','zh')) {
+              $rows = @($multi.languages | Where-Object { $_.language -eq $lang })
+              if ($rows.Count -ne 1 -or $rows[0].original_text_exact_cues -ne 2 -or
+                  $rows[0].verified_model -ne $true -or $rows[0].real_ffmpeg_video_frames -ne $true -or
+                  $rows[0].srt_ass_verified -ne $true -or
+                  [double]$rows[0].max_timing_error_seconds -gt 0.65 -or
+                  [double]$rows[0].max_srt_ass_timing_delta_seconds -gt 0.02) {
+                throw "Frozen OCR failed exact source-language video: $lang"
+              }
+            }
+            Write-Host 'HSE_PINNED_MULTILANG=PASS;LANGUAGES=KO_EN_JA_ZH;EXACT_CUES=8;SRT_ASS=PASS'
+
+            $fallbackPath = Join-Path $scratch 'fallback.json'
+            Run-Frozen @('--public-video-ocr-acceptance','--ocr-fixture-dir',$fixtures,'--public-ocr-report',$fallbackPath) 10
+            if (-not (Test-Path -LiteralPath $fallbackPath -PathType Leaf)) { throw 'Frozen public fallback report missing' }
+            $fallback = Get-Content -LiteralPath $fallbackPath -Raw | ConvertFrom-Json
+            if ($fallback.type -ne 'frozen_public_video_ocr_fallback_acceptance' -or
+                $fallback.ok -ne $true -or $fallback.is_frozen -ne $true -or
+                $fallback.transport -ne 'synthetic_local_no_network' -or
+                $fallback.temporary_outputs_removed -ne $true -or
+                $fallback.raw_media_retained -ne $false -or
+                $fallback.exact_total -ne 8 -or @($fallback.languages).Count -ne 4) {
+              throw 'Frozen video-without-soft-captions fallback was not accepted'
+            }
+            foreach ($lang in @('ko','en','ja','zh')) {
+              $rows = @($fallback.languages | Where-Object { $_.language -eq $lang })
+              if ($rows.Count -ne 1 -or $rows[0].exact_cues -ne 2 -or
+                  $rows[0].real_encoded_mp4_and_ocr -ne $true -or
+                  $rows[0].single_video_transfer -ne $true -or
+                  $rows[0].temporary_video_removed -ne $true -or
+                  $rows[0].soft_caption_preserved -ne $true -or
+                  $rows[0].read_only_visual_resume_verified -ne $true -or
+                  $rows[0].read_only_soft_resume_verified -ne $true -or
+                  [double]$rows[0].max_timeline_error_seconds -gt 0.65 -or
+                  [double]$rows[0].max_srt_ass_delta_seconds -gt 0.02) {
+                throw "Frozen public-fallback original-text check failed: $lang"
+              }
+            }
+            Write-Host 'HSE_PINNED_PUBLIC_FALLBACK=PASS;LANGUAGES=KO_EN_JA_ZH;EXACT_CUES=8;NETWORK=NO'
+            Write-Host "HSE_PRESERVED_EXE_SHA256=$hash;OPERATING_FILES_CHANGED=NO;PAID_API=NO"
+          } finally {
+            if (Test-Path -LiteralPath $scratch) {
+              Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }

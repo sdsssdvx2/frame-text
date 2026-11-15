@@ -1,0 +1,64 @@
+name: HSE isolated native VideoSubFinder four-language style matrix
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-vsf-matrix-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  matrix-research:
+    if: ${{ contains(github.event.head_commit.message, '[hse-vsf-matrix-qa]') }}
+    runs-on: windows-2025
+    timeout-minutes: 26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create dedicated Python fixture environment (no OCR models)
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'fixed official Windows x64 native research only'
+          }
+          if (Test-Path .venv-hse-vsf-matrix) { throw 'isolation collision' }
+          python -m venv .venv-hse-vsf-matrix
+          if ($LASTEXITCODE -ne 0) { throw 'isolated Python venv unavailable' }
+          (Resolve-Path .venv-hse-vsf-matrix\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install only local generated-video dependencies
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: "src;tools"
+        run: |
+          python -m pip install "numpy>=2.0" "opencv-python-headless>=4.10" "Pillow>=10"
+          if ($LASTEXITCODE -ne 0) { throw 'synthetic fixture dependencies missing' }
+          python -B -m unittest discover -s tests -p test_vsf_generalization_research.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'native generalization contract failed' }
+          python -B -m unittest discover -s tests -p test_vsf_timing_research.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'native archive safety contract failed' }
+      - name: Prepare SHA-verified LGPL FFmpeg for encoded MP4 fixtures
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'pinned video codec unavailable' }
+      - name: Run 4 languages x two styles x paired blanks through official native VSF
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -B tools/compare_vsf_generalization.py
+          if ($LASTEXITCODE -ne 0) { throw 'external detector matrix incomplete' }
+      - name: Erase isolated fixture dependencies
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Remove-Item .venv-hse-vsf-matrix -Recurse -Force -ErrorAction SilentlyContinue

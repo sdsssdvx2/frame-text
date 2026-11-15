@@ -1,0 +1,35 @@
+name: HSE AVL candidate scoring contract offline-only (HOLD)
+
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+
+permissions:
+  contents: read
+
+jobs:
+  avl-score-contract:
+    if: ${{ contains(github.event.head_commit.message, '[hse-avl-score-contract]') }}
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run only 7 synthetic reference/output integrity tests (NO vendor code)
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: "tools"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PYTHONDONTWRITEBYTECODE = '1'
+          python -B -m unittest discover -s tests -p test_avl_public_natural.py -v
+          if ($LASTEXITCODE -ne 0) {
+            throw "HSE AVL offline scorer contract verification failed"
+          }
+          Write-Host 'HSE_AVL_SCORE_CONTRACT=PASS;VENDOR_CODE_EXECUTED=NO;MODEL_CALLS=0;USER_INPUT=NONE;RELEASE_AUTHORIZED=NO'

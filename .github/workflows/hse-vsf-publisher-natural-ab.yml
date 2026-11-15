@@ -1,0 +1,125 @@
+name: HSE publisher-authored VSF-vs-HSE natural caption A/B (HOLD)
+
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-publisher-natural-vsf-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  one-natural-pair:
+    if: ${{ contains(github.event.head_commit.message, '[hse-natural-vsf-ab]') }}
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare isolated local models, do not run unrelated test suites
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'Pinned VSF native runner requires Windows x64'
+          }
+          if (Test-Path .venv-hse-natural-vsf) {
+            throw 'Existing scratch venv cannot be replaced'
+          }
+          python -m venv .venv-hse-natural-vsf
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create study environment' }
+          (Resolve-Path .venv-hse-natural-vsf\Scripts).Path |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $modelScratch = Join-Path $env:RUNNER_TEMP "hse-natural-vsf-$env:GITHUB_RUN_ID"
+          if (Test-Path $modelScratch) { throw 'Existing study scratch not reusable' }
+          New-Item -ItemType Directory -Path $modelScratch | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "HSE_NATURAL_VSF_MODELS=$modelScratch"
+
+      - name: Verify pinned local video decoding and OCR dependencies
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install -e ".[ocr]"
+          if ($LASTEXITCODE -ne 0) { throw 'OCR runtime installation failed' }
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned FFmpeg unavailable' }
+          $models = Join-Path $env:HSE_NATURAL_VSF_MODELS 'models'
+          python -B tools/prepare_models.py --languages en --out $models
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned official OCR model not available' }
+          Write-Host 'HSE_NATURAL_VSF_DEPENDENCIES=READY;NO_UNRELATED_UNIT_TESTS=YES'
+
+      - name: ONE real publisher-caption and clean-video comparison, with no user files
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $models = Join-Path $env:HSE_NATURAL_VSF_MODELS 'models'
+          python -B tools/compare_vsf_on_publisher_natural.py --model-dir $models --accept-public-source
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Real natural-content VSF/HSE inference did not complete; do not claim quality improvement'
+          }
+
+      - name: Clean up this study's scratch only
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          if (Test-Path .venv-hse-natural-vsf) {
+            Remove-Item .venv-hse-natural-vsf -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          if ($env:HSE_NATURAL_VSF_MODELS -and
+              $env:HSE_NATURAL_VSF_MODELS -like (Join-Path $env:RUNNER_TEMP 'hse-natural-vsf-*')) {
+            Remove-Item -LiteralPath $env:HSE_NATURAL_VSF_MODELS -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host 'HSE_NATURAL_VSF_RELEASE_AUTHORIZED=NO'
+
+  native-roi-transport:
+    if: ${{ contains(github.event.head_commit.message, '[hse-vsf-roi-contract]') }}
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test only the changed VSF region selection and native timing bridge
+        shell: pwsh
+        env:
+          PYTHONPATH: "src"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path .venv-hse-vsf-roi) {
+            throw 'Existing test environment would be overwritten'
+          }
+          python -m venv .venv-hse-vsf-roi
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot create scratch venv' }
+          try {
+            & .venv-hse-vsf-roi\Scripts\python.exe -m pip install --disable-pip-version-check numpy==2.5.4
+            if ($LASTEXITCODE -ne 0) { throw 'Required numeric library missing' }
+            & .venv-hse-vsf-roi\Scripts\python.exe -B -m unittest discover -s tests -p test_native_vsf_timing.py -v
+            if ($LASTEXITCODE -ne 0) { throw 'New ROI-native transport not verified' }
+            Write-Host 'HSE_NATIVE_VSF_ROI_CONTRACT=PASS;MODEL_CALLS=0;EXTERNAL_EXE_RUN=NO;PRODUCTION_UNCHANGED=YES'
+          }
+          finally {
+            Remove-Item .venv-hse-vsf-roi -Recurse -Force -ErrorAction SilentlyContinue
+          }

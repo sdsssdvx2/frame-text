@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "profile": "rapidocr-3.10.0-ppocrv5-korean-mobile",
+  "engine": "onnxruntime",
+  "rapidocr_version": "3.10.0",
+  "onnxruntime_version": "1.31.1",
+  "assets": {
+    "detector": {
+      "filename": "ch_PP-OCRv5_det_mobile.onnx",
+      "url": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.10.0/onnx/PP-OCRv5/det/ch_PP-OCRv5_det_mobile.onnx",
+      "mirrors": [
+        "https://huggingface.co/tamnvcc/PaddleOCRv5/resolve/main/PP-OCRv5_mobile_det_infer.onnx",
+        "https://huggingface.co/ogkalu/ppocr-v5-onnx/resolve/3b76726/ch_PP-OCRv5_mobile_det.onnx"
+      ],
+      "sha256": "4d97c44a20d30a81aad087d6a396b08f786c4635742afc391f6621f5c6ae78ae"
+    },
+    "recognizer": {
+      "filename": "korean_PP-OCRv5_rec_mobile.onnx",
+      "url": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.10.0/onnx/PP-OCRv5/rec/korean_PP-OCRv5_rec_mobile.onnx",
+      "mirrors": [
+        "https://huggingface.co/ogkalu/ppocr-v5-onnx/resolve/main/korean_PP-OCRv5_rec_mobile_infer.onnx"
+      ],
+      "sha256": "cd6e2ea50f6943ca7271eb8c56a877a5a90720b7047fe9c41a2e541a25773c9b"
+    },
+    "dictionary": {
+      "filename": "ppocrv5_korean_dict.txt",
+      "url": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.10.0/paddle/PP-OCRv5/rec/korean_PP-OCRv5_rec_mobile/ppocrv5_korean_dict.txt",
+      "mirrors": [
+        "https://huggingface.co/ogkalu/ppocr-v5-onnx/resolve/main/ppocrv5_korean_dict.txt"
+      ],
+      "sha256": "a88071c68c01707489baa79ebe0405b7beb5cca229f4fc94cc3ef992328802d7",
+      "size_bytes": 47451
+    }
+  },
+  "alternate_upstream_reference": {
+    "note": "PaddlePaddle official ONNX artifacts are compatible reference assets but are not the primary RapidOCR-converted bytes.",
+    "detector_sha256": "a431985659dc921974177a95adcfbb90fd9e51989a5e04d70d0b75f597b6e61d",
+    "recognizer_sha256": "92f0b7785e64fc9090106a241cf4c1eb97472824558272751b88a2a4476d3a08",
+    "recognizer_size_bytes": 13418787,
+    "dictionary_sha256": "a88071c68c01707489baa79ebe0405b7beb5cca229f4fc94cc3ef992328802d7",
+    "dictionary_size_bytes": 47451
+  },
+  "additional_profiles": {
+    "en": {
+      "rapidocr_language": "en",
+      "recognizer": {
+        "filename": "en_PP-OCRv5_rec_mobile.onnx",
+        "url": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.10.0/onnx/PP-OCRv5/rec/en_PP-OCRv5_rec_mobile.onnx",
+        "sha256": "c3461add59bb4323ecba96a492ab75e06dda42467c9e3d0c18db5d1d21924be8",
+        "size_bytes": 7872351,
+        "mirrors": [
+          "https://huggingface.co/ogkalu/ppocr-v5-onnx/resolve/3b76726/en_PP-OCRv5_rec_mobile_infer.onnx",
+          "https://huggingface.co/pitapo/rapidocr/resolve/f2a4d3e/onnx/PP-OCRv5/rec/en_PP-OCRv5_rec_mobile_infer.onnx"
+        ]
+      },
+      "dictionary": {
+        "filename": "ppocrv5_en_dict.txt",
+        "url": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.10.0/paddle/PP-OCRv5/rec/en_PP-OCRv5_rec_mobile/ppocrv5_en_dict.txt",
+        "sha256": "e025a66d31f327ba0c232e03f407ae8d105e1e709e7ccb3f408aa778c24e70d6",
+        "size_bytes": 1416,
+        "mirrors": [
+          "https://huggingface.co/ogkalu/ppocr-v5-onnx/resolve/3b76726/ppocrv5_en_dict.txt"
+        ]
+      }
+    },
+    "cjk": {
+      "rapidocr_language": "ch",
+      "recognizer": {
+        "filename": "ch_PP-OCRv5_rec_mobile.onnx",
+        "url": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.10.0/onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile.onnx",
+        "sha256": "5825fc7ebf84ae7a412be049820b4d86d77620f204a041697b0494669b1742c5",
+        "size_bytes": 16631306,
+        "mirrors": [
+          "https://huggingface.co/ogkalu/ppocr-v5-onnx/resolve/3b76726/ch_PP-OCRv5_rec_mobile_infer.onnx",
+          "https://huggingface.co/pitapo/rapidocr/resolve/f2a4d3e/onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer.onnx"
+        ]
+      },
+      "dictionary": {
+        "filename": "ppocrv5_dict.txt",
+        "url": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.10.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile/ppocrv5_dict.txt",
+        "sha256": "d1979e9f794c464c0d2e0b70a7fe14dd978e9dc644c0e71f14158cdf8342af1b",
+        "size_bytes": 74012,
+        "mirrors": [
+          "https://huggingface.co/ogkalu/ppocr-v5-onnx/resolve/3b76726/ppocrv5_dict.txt"
+        ]
+      }
+    }
+  }
+}

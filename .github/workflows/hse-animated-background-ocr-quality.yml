@@ -1,0 +1,66 @@
+name: HSE moving illustrated-background OCR quality
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-animated-ocr-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  animated-source-quality:
+    if: ${{ contains(github.event.head_commit.message, '[hse-animated-ocr-qa]') }}
+    runs-on: windows-2025
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create isolated animation OCR test runtime
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw "animated quality gate requires isolated Windows X64"
+          }
+          python -m venv .venv-hse-animated
+          if ($LASTEXITCODE -ne 0) { throw "temporary test venv failed" }
+          (Resolve-Path .venv-hse-animated\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install pinned OCR production runtime
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[ocr]"
+          if ($LASTEXITCODE -ne 0) { throw "pinned OCR dependencies unavailable" }
+      - name: Prepare verified offline FFmpeg
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw "verified FFmpeg unavailable" }
+      - name: Generate moving illustrated MP4 and measure four real OCR models
+        shell: pwsh
+        run: |
+          $isolated = Join-Path $env:RUNNER_TEMP "hse-animated-$env:GITHUB_RUN_ID"
+          if (Test-Path $isolated) { throw "isolation directory unexpectedly exists" }
+          New-Item -ItemType Directory -Path $isolated | Out-Null
+          $models = Join-Path $isolated "models"
+          try {
+            python -B tools/prepare_models.py --languages ko,en,zh --out $models *> $null
+            if ($LASTEXITCODE -ne 0) { throw "pinned four-language OCR model setup failed" }
+            python -B tools/verify_animated_background_ocr_quality.py --model-dir $models --languages ko,en,ja,zh --max-cer 0.15 --max-time-error 0.65
+            if ($LASTEXITCODE -ne 0) {
+              throw "genuine illustrated moving MP4 OCR quality not verified"
+            }
+          }
+          finally {
+            Remove-Item -LiteralPath $isolated -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Remove isolated test runtime
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Remove-Item .venv-hse-animated -Recurse -Force -ErrorAction SilentlyContinue

@@ -1,0 +1,67 @@
+name: HSE Dailymotion public transcript video live compatibility proof
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  dailymotion-live:
+    if: contains(github.event.head_commit.message, '[hse-dailymotion-live]')
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare disposable provider compatibility runtime
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "hse-dailymotion-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $root) { throw 'Refusing to alter preexisting scratch' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          python -m venv (Join-Path $root 'venv')
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated Python unavailable' }
+          (Resolve-Path (Join-Path $root 'venv\Scripts')).Path |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "HSE_DAILY_SCRATCH=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Prepare isolated HSE source and pinned official downloader
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -e . *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'HSE source dependencies unavailable' }
+          pwsh -NoProfile -File tools/prepare_yt_dlp_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Official pinned yt-dlp invalid' }
+      - name: One published public Dailymotion transcript video, subtitle-first only
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $report = Join-Path $env:HSE_DAILY_SCRATCH 'caption-compatibility.json'
+          python -B tools/hse_public_caption_probe.py --url 'https://www.dailymotion.com/video/x9su6ac' --languages en --yt-dlp 'bin/yt-dlp.exe' --max-seconds 180 --report $report
+          if ($LASTEXITCODE -ne 0) { throw 'Live diagnostic structural verification failed' }
+          $data = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
+          if ($data.results.Count -ne 1 -or $data.results[0].site -ne 'dailymotion') {
+            throw 'Dailymotion sample did not use explicit provider route'
+          }
+          if ($data.results[0].status -eq 'downloaded' -and $data.results[0].files_verified -eq $true) {
+            Write-Host 'HSE_DAILYMOTION_PUBLIC_SUBTITLE_E2E=PASS;RAW_SRT_ASS=VERIFIED'
+          } else {
+            Write-Host ('HSE_DAILYMOTION_PUBLIC_SUBTITLE_E2E=HOLD;STATUS=' + $data.results[0].status)
+          }
+          if ($data.results[0].status -eq 'integrity_failed') {
+            throw 'Actual public subtitle files inconsistent; safety gate failed'
+          }
+      - name: Remove only private scratch environment and transient captions
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:HSE_DAILY_SCRATCH -and
+              $env:HSE_DAILY_SCRATCH.StartsWith($env:RUNNER_TEMP)) {
+            Remove-Item -LiteralPath $env:HSE_DAILY_SCRATCH -Recurse -Force -ErrorAction SilentlyContinue
+          }

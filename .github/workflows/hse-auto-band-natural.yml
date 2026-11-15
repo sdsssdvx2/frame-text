@@ -1,0 +1,69 @@
+name: HSE real publisher automatic subtitle-band research (HOLD)
+
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-auto-band-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  real-auto-band:
+    if: ${{ contains(github.event.head_commit.message, '[hse-auto-band-natural]') }}
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Measure source-only recurring box band against independent natural reference
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'Windows x64 real-source OCR research only'
+          }
+          $root=Join-Path $env:RUNNER_TEMP "hse-auto-band-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $root) { throw 'owned scratch collision' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          try {
+            $venv=Join-Path $root 'venv'
+            python -m venv $venv
+            if ($LASTEXITCODE -ne 0) { throw 'isolated Python setup failed' }
+            $py=Join-Path $venv 'Scripts\python.exe'
+            & $py -m pip install --disable-pip-version-check -e '.[ocr]' *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'free OCR runtime unavailable' }
+
+            $bin=Join-Path $root 'bin'
+            pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1 -Destination $bin *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'pinned LGPL FFmpeg unavailable' }
+            $env:HSE_FFMPEG=Join-Path $bin 'ffmpeg.exe'
+            $env:HSE_FFPROBE=Join-Path $bin 'ffprobe.exe'
+
+            $models=Join-Path $root 'models'
+            & $py -B tools/prepare_models.py --languages en --out $models *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'SHA-pinned English OCR model unavailable' }
+
+            & $py -B -m py_compile tools/compare_auto_band_natural.py
+            if ($LASTEXITCODE -ne 0) { throw 'auto-band research tool syntax invalid' }
+
+            & $py -B tools/compare_auto_band_natural.py --scratch (Join-Path $root 'media') --model-dir $models --manifest (Join-Path $env:GITHUB_WORKSPACE 'models/manifest.json') --approve-public-sources
+            if ($LASTEXITCODE -ne 0) { throw 'real publisher auto-band comparison failed; no retry' }
+            Write-Host 'HSE_AUTO_BAND_NATURAL=MEASURED;REFERENCE_NOT_USED_FOR_SELECTION=YES;DEFAULT_UNCHANGED=YES;RELEASE=HOLD'
+          }
+          finally {
+            if (Test-Path -LiteralPath $root) {
+              Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }

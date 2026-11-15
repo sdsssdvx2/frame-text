@@ -1,0 +1,66 @@
+name: HSE Japanese manga-ocr recognizer candidate (research HOLD)
+
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-manga-ocr-ja-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  manga-ocr-ja:
+    if: ${{ contains(github.event.head_commit.message, '[hse-manga-ocr-ja]') }}
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compare HSE-selected Japanese crops with pinned free manga OCR
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'Windows x64 OCR research only'
+          }
+          $root=Join-Path $env:RUNNER_TEMP "hse-manga-ocr-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $root) { throw 'owned scratch collision' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          try {
+            $venv=Join-Path $root 'venv'
+            python -m venv $venv
+            if ($LASTEXITCODE -ne 0) { throw 'isolated Python failed' }
+            $py=Join-Path $venv 'Scripts\python.exe'
+            & $py -m pip install --disable-pip-version-check -e '.[ocr]' *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'HSE free OCR runtime unavailable' }
+            & $py -m pip install --disable-pip-version-check --index-url https://download.pytorch.org/whl/cpu 'torch==2.14.1+cpu' *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'exact official CPU PyTorch unavailable' }
+            & $py -m pip install --disable-pip-version-check 'manga-ocr==0.1.16' *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'pinned Apache manga-ocr package unavailable' }
+            $mangaVersion=& $py -c "import importlib.metadata as m; print(m.version('manga-ocr'))"
+            if ($LASTEXITCODE -ne 0 -or $mangaVersion.Trim() -ne '0.1.16') {
+              throw 'manga-ocr package version mismatch'
+            }
+            $models=Join-Path $root 'hse-models'
+            & $py -B tools/prepare_models.py --languages zh --out $models *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'HSE model pin failed' }
+            & $py -B tools/compare_japanese_manga_ocr.py --model-dir $models --manifest (Join-Path $env:GITHUB_WORKSPACE 'models/manifest.json') --candidate-model-dir (Join-Path $root 'manga-model') --approve-cc-dataset-download
+            if ($LASTEXITCODE -ne 0) { throw 'manga OCR Japanese candidate comparison incomplete; no retry' }
+            Write-Host 'HSE_MANGA_OCR_JA=MEASURED;PRODUCT_UNCHANGED=YES;RELEASE=HOLD'
+          }
+          finally {
+            if (Test-Path -LiteralPath $root) {
+              Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }

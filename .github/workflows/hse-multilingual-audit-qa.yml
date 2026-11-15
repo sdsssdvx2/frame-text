@@ -1,0 +1,131 @@
+name: HSE multilingual offline subtitle quality audit and overlay review
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-multilingual-quality-audit
+  cancel-in-progress: false
+
+jobs:
+  read-only-quality:
+    if: contains(github.event.head_commit.message, '[hse-quality-audit]')
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Make disposable Python 3.12 audit environment
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'Windows x64 required for independent hosted-runner fallback'
+          }
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-quality-audit-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $scratch) {
+            throw 'Research sandbox already exists; refusing to overwrite'
+          }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          $venv = Join-Path $scratch 'venv'
+          python -m venv $venv
+          if ($LASTEXITCODE -ne 0) { throw 'audit environment creation failed' }
+          (Resolve-Path (Join-Path $venv 'Scripts')).Path |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "HSE_QUALITY_AUDIT_SCRATCH=$scratch" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install only NumPy and Pillow for private review, no OCR/browser
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check "numpy>=2,<3" "Pillow>=10,<13"
+          if ($LASTEXITCODE -ne 0) { throw 'minimal isolated audit dependency failed' }
+      - name: Run original-language, no-text-leak, and safe review regressions
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $tests = @(
+            'test_quality_audit.py',
+            'test_quality_audit_cli.py',
+            'test_subtitle_review_pack.py',
+            'test_subtitle_formats.py'
+          )
+          $count = 0
+          foreach ($pattern in $tests) {
+            Write-Host "HSE_QUALITY_AUDIT_SUITE=$pattern"
+            python -B -m unittest discover -s tests -p $pattern -v
+            if ($LASTEXITCODE -ne 0) { throw "Audit regression failed: $pattern" }
+            $count++
+          }
+          if ($count -ne 4) { throw 'Incomplete quality audit suite inventory' }
+          Write-Host "HSE_QUALITY_AUDIT_OFFLINE_PASS=TRUE;SUITES=4;USER_FILES_CHANGED=NO"
+      - name: Verify SHA-pinned LGPL FFmpeg/FFprobe source-metadata toolchain
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'SHA-pinned FFmpeg/FFprobe preparation failed' }
+      - name: Real encoded MP4 and FFprobe duration through safe quality-audit CLI
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          if (-not $env:HSE_QUALITY_AUDIT_SCRATCH) { throw 'Missing isolated audit directory' }
+          $media = Join-Path $env:HSE_QUALITY_AUDIT_SCRATCH 'synthetic-3sec.mp4'
+          $srt = Join-Path $env:HSE_QUALITY_AUDIT_SCRATCH 'synthetic-caption.srt'
+          $encoder = Join-Path (Get-Location) 'bin\ffmpeg.exe'
+          & $encoder -nostdin -hide_banner -loglevel error -f lavfi -i 'color=c=black:s=320x180:r=8:d=3' -an -c:v mpeg4 -q:v 4 -pix_fmt yuv420p -movflags +faststart -n $media
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $media)) {
+            throw 'Real local MP4 generation failed'
+          }
+          [System.IO.File]::WriteAllText(
+            $srt, ([string]::Join([Environment]::NewLine, @(
+              '1','00:00:00,000 --> 00:00:03,000','합성 시험 자막',''
+            ))), [System.Text.UTF8Encoding]::new($false)
+          )
+          $videoPin = (Get-FileHash -LiteralPath $media -Algorithm SHA256).Hash
+          $cuePin = (Get-FileHash -LiteralPath $srt -Algorithm SHA256).Hash
+          $raw = & python -B tools/subtitle_quality_audit.py --candidate $srt --video $media --language ko
+          if ($LASTEXITCODE -ne 0) { throw 'Actual FFprobe-backed quality audit rejected generated MP4' }
+          $report = ([string]::Join([Environment]::NewLine, $raw)) | ConvertFrom-Json
+          if ($report.accuracy_verified -ne $false -or
+              $report.candidate.independent_video_duration_supplied -ne $true -or
+              $report.candidate.warning_counts.near_full_runtime_single_cue_review -ne 1 -or
+              $report.candidate.cue_count -ne 1) {
+            throw 'Incorrect review-only video duration or source text gate'
+          }
+          if ($videoPin -ne (Get-FileHash -LiteralPath $media -Algorithm SHA256).Hash -or
+              $cuePin -ne (Get-FileHash -LiteralPath $srt -Algorithm SHA256).Hash) {
+            throw 'An input file was changed by the audit'
+          }
+          $privateReview = Join-Path $env:HSE_QUALITY_AUDIT_SCRATCH 'private-review'
+          python -B tools/subtitle_review_pack.py --video $media --candidate $srt --output $privateReview --mode all --max-cues 1
+          if ($LASTEXITCODE -ne 0) { throw 'actual encoded video review pack failed' }
+          $index = (Get-Content -LiteralPath (Join-Path $privateReview 'index.json') -Raw) | ConvertFrom-Json
+          if ($index.review_cues.Count -ne 1 -or
+              -not (Test-Path -LiteralPath (Join-Path $privateReview 'contact-sheet.jpg')) -or
+              -not (Test-Path -LiteralPath (Join-Path $privateReview 'cue-00001-early.jpg')) -or
+              -not (Test-Path -LiteralPath (Join-Path $privateReview 'cue-00001-late.jpg'))) {
+            throw 'real video review pack output incomplete'
+          }
+          if ($videoPin -ne (Get-FileHash -LiteralPath $media -Algorithm SHA256).Hash -or
+              $cuePin -ne (Get-FileHash -LiteralPath $srt -Algorithm SHA256).Hash) {
+            throw 'review pack mutated a source'
+          }
+          Write-Host 'HSE_REVIEW_PACK_REAL_FFMPEG_PASS=TRUE;SOURCE_CHANGED=NO'
+          Write-Host 'HSE_QUALITY_AUDIT_REAL_FFPROBE_PASS=TRUE;MEDIA_CHANGED=NO;SUBTITLE_CHANGED=NO'
+      - name: Delete isolated audit environment
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:HSE_QUALITY_AUDIT_SCRATCH -and
+              $env:HSE_QUALITY_AUDIT_SCRATCH.StartsWith($env:RUNNER_TEMP)) {
+            Remove-Item -LiteralPath $env:HSE_QUALITY_AUDIT_SCRATCH -Recurse -Force -ErrorAction SilentlyContinue
+          }

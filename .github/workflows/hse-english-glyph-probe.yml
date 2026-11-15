@@ -1,0 +1,46 @@
+name: HSE isolated English leading-glyph study
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  english-glyph-diagnostic:
+    if: ${{ contains(github.event.head_commit.message, '[hse-english-glyph-probe]') }}
+    runs-on: windows-2025
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare isolated test dependencies and pinned FFmpeg
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw "requires Windows x64"
+          }
+          python -m venv .venv-hse-english-glyph
+          if ($LASTEXITCODE -ne 0) { throw "venv creation failed" }
+          (Resolve-Path .venv-hse-english-glyph\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw "pinned FFmpeg prepare failed" }
+      - name: Run the genuinely pinned model against only an isolated English sample
+        shell: pwsh
+        run: |
+          $isolated = Join-Path $env:RUNNER_TEMP "hse-glyph-$env:GITHUB_RUN_ID"
+          try {
+            python -m pip install -e ".[ocr]"
+            if ($LASTEXITCODE -ne 0) { throw "isolated OCR runtime install failed" }
+            python -B tools/prepare_models.py --languages en --out $isolated *> $null
+            if ($LASTEXITCODE -ne 0) { throw "model integrity verification failed" }
+            python -B tools/diagnose_english_edge_glyph.py --model-dir $isolated
+            if ($LASTEXITCODE -ne 0) { throw "English diagnostic execution failed" }
+          } finally {
+            Remove-Item -LiteralPath $isolated -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath .venv-hse-english-glyph -Recurse -Force -ErrorAction SilentlyContinue
+          }

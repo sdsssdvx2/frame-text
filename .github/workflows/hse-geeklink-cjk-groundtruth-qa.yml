@@ -1,0 +1,82 @@
+name: HSE licensed CJK 72-frame independent ground-truth OCR (research HOLD)
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+permissions:
+  contents: read
+jobs:
+  independent-cjk-frame-ocr:
+    if: ${{ contains(github.event.head_commit.message, '[hse-geeklink-cjk]') || contains(github.event.head_commit.message, '[hse-ort-cpu-threads]') || contains(github.event.head_commit.message, '[hse-openvino-cjk]') }}
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Independently pin CC0 CJK annotations and 72 published source images, compare free OCR
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          HSE_ORT_STUDY: ${{ contains(github.event.head_commit.message, '[hse-ort-cpu-threads]') }}
+          HSE_OPENVINO_STUDY: ${{ contains(github.event.head_commit.message, '[hse-openvino-cjk]') }}
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 only' }
+          $root=Join-Path $env:RUNNER_TEMP "hse-geeklink-cjk-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $root) { throw 'owned scratch collision' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          try {
+            $venv=Join-Path $root 'venv'
+            python -m venv $venv
+            if ($LASTEXITCODE -ne 0) { throw 'isolated Python setup failed' }
+            $py=Join-Path $venv 'Scripts\python.exe'
+            & $py -m pip install --disable-pip-version-check -e '.[ocr]' *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'declared OCR dependencies unavailable' }
+            $env:PYTHONPATH="$env:GITHUB_WORKSPACE\src;$env:GITHUB_WORKSPACE\tools"
+            $env:TMP=$root; $env:TEMP=$root
+            if ($env:HSE_OPENVINO_STUDY -eq 'true') {
+              & $py -B -m unittest discover -s tests -p test_rapidocr_thread_options.py -q
+              if ($LASTEXITCODE -ne 0) { throw 'OCR backend configuration contract failed' }
+              & $py -m pip install --disable-pip-version-check 'openvino==2026.4.1' *> $null
+              if ($LASTEXITCODE -ne 0) { throw 'exact free OpenVINO runtime unavailable' }
+              $ovVersion = & $py -c "import importlib.metadata as m; print(m.version('openvino'))"
+              if ($LASTEXITCODE -ne 0 -or $ovVersion.Trim() -ne '2026.4.1') {
+                throw 'OpenVINO version pin not satisfied'
+              }
+              $models=Join-Path $root 'models'
+              & $py -B tools/prepare_models.py --languages zh --out $models *> $null
+              if ($LASTEXITCODE -ne 0) { throw 'SHA-pinned free CJK models unavailable' }
+              & $py -B tools/compare_cjk_openvino.py --model-dir $models --manifest (Join-Path $env:GITHUB_WORKSPACE 'models/manifest.json') --approve-cc-dataset-download
+              if ($LASTEXITCODE -ne 0) { throw 'OpenVINO same-model CJK comparison failed' }
+              Write-Host 'HSE_OPENVINO_CJK=MEASURED;SAME_MODEL_BITS=YES;DEFAULT_INERT=YES;RELEASE=HOLD'
+              return
+            }
+            if ($env:HSE_ORT_STUDY -eq 'true') {
+              & $py -B -m unittest discover -s tests -p test_rapidocr_thread_options.py -q
+              if ($LASTEXITCODE -ne 0) { throw 'ONNX threading configuration contract failed' }
+              $models=Join-Path $root 'models'
+              & $py -B tools/prepare_models.py --languages zh --out $models *> $null
+              if ($LASTEXITCODE -ne 0) { throw 'SHA-pinned free CJK models unavailable' }
+              & $py -B tools/compare_cjk_onnx_cpu_threads.py --model-dir $models --manifest (Join-Path $env:GITHUB_WORKSPACE 'models/manifest.json') --approve-cc-dataset-download
+              if ($LASTEXITCODE -ne 0) { throw 'Independent CJK CPU-thread comparison failed' }
+              Write-Host 'HSE_ORT_CPU_THREADS=MEASURED;DEFAULT_INERT=YES;RELEASE=HOLD'
+              return
+            }
+            & $py -B -m unittest discover -s tests -p test_caption_islands.py -q
+            if ($LASTEXITCODE -ne 0) { throw 'existing spatial OCR composition invalid' }
+            $models=Join-Path $root 'models'
+            & $py -B tools/prepare_models.py --languages ko,zh --out $models *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'free SHA-pinned CJK models unavailable' }
+            & $py -B tools/verify_geeklink_cjk_frame_groundtruth.py --approve-cc-dataset-download --model-dir $models --manifest (Join-Path $env:GITHUB_WORKSPACE 'models/manifest.json')
+            if ($LASTEXITCODE -ne 0) { throw 'independent CJK benchmark incomplete; no automatic retry' }
+            Write-Host 'HSE_GEEKLINK_CJK=MEASURED;LANGS=KO_JA_ZH;FRAMES=72;HUMAN_NATURAL_VIDEO_NOT_PROVEN=YES;DEFAULT_UNCHANGED=YES;RELEASE=HOLD'
+          }
+          finally {
+            if (Test-Path -LiteralPath $root) {
+              Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }

@@ -1,0 +1,58 @@
+name: HSE PP-OCRv5 mobile vs server CJK recognizer (research HOLD)
+
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-v5-server-cjk-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  v5-server-cjk:
+    if: ${{ contains(github.event.head_commit.message, '[hse-v5-server-cjk]') }}
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compare exact official V5 server recognizer on pinned JA/ZH truth
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'Windows x64 only'
+          }
+          $root=Join-Path $env:RUNNER_TEMP "hse-v5-server-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $root) { throw 'owned scratch collision' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          try {
+            $venv=Join-Path $root 'venv'
+            python -m venv $venv
+            if ($LASTEXITCODE -ne 0) { throw 'isolated Python failed' }
+            $py=Join-Path $venv 'Scripts\python.exe'
+            & $py -m pip install --disable-pip-version-check -e '.[ocr]' *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'declared OCR runtime unavailable' }
+            $models=Join-Path $root 'models'
+            & $py -B tools/prepare_models.py --languages zh --out $models *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'current V5 CJK model pin failed' }
+            & $py -B tools/compare_cjk_v5_server_recognizer.py --model-dir $models --manifest (Join-Path $env:GITHUB_WORKSPACE 'models/manifest.json') --scratch (Join-Path $root 'server') --approve-cc-dataset-download
+            if ($LASTEXITCODE -ne 0) { throw 'V5 mobile/server CJK comparison incomplete; no retry' }
+            Write-Host 'HSE_V5_SERVER_CJK=MEASURED;CURRENT_DEFAULT_UNCHANGED=YES;RELEASE=HOLD'
+          }
+          finally {
+            if (Test-Path -LiteralPath $root) {
+              Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }

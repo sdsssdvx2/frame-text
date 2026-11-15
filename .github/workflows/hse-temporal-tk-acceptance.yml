@@ -1,0 +1,51 @@
+name: HSE actual Windows Tk temporal review scratch acceptance (HOLD)
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+permissions:
+  contents: read
+concurrency:
+  group: hse-temporal-tk-${{ github.sha }}
+  cancel-in-progress: false
+jobs:
+  real-Tk-private-review:
+    if: ${{ contains(github.event.head_commit.message, '[hse-temporal-tk]') }}
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run real Tk local single-pass capture and manual review on disposable generated video
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 required' }
+          $scratch=Join-Path $env:RUNNER_TEMP "hse-actual-Tk-temporal-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $scratch) { throw 'scratch collision' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          try {
+            python -m venv (Join-Path $scratch 'venv')
+            if ($LASTEXITCODE -ne 0) { throw 'isolated Windows Python missing' }
+            $py=Join-Path $scratch 'venv\Scripts\python.exe'
+            $env:PYTHONPATH="$env:GITHUB_WORKSPACE\src;$env:GITHUB_WORKSPACE\tools"
+            $env:TMP=$scratch; $env:TEMP=$scratch
+            & $py -m pip install --disable-pip-version-check -e '.[ocr]' *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'free HSE runtime unavailable' }
+            pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1 *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'verified FFmpeg unavailable' }
+            & $py -B tools/verify_real_temporal_review_tk.py
+            if ($LASTEXITCODE -ne 0) { throw 'actual Tk temporal review private evidence acceptance incomplete' }
+            Write-Host 'HSE_TK_TEMPORAL=SCRATCH_ACCEPTED;REAL_TK=YES;REAL_FFMPEG=YES;MODEL=MOCK;OPERATING_CHANGED=NO;RELEASE=HOLD'
+          }
+          finally {
+            if (Test-Path -LiteralPath $scratch) {
+              Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }

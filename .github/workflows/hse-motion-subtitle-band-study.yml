@@ -1,0 +1,62 @@
+name: HSE moving-caption-band segmentation study
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-motion-band-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  independent-detector-study:
+    if: ${{ contains(github.event.head_commit.message, '[hse-motion-band-qa]') }}
+    runs-on: windows-2025
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare isolated source-only comparison environment
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw "HSE motion benchmark needs isolated Windows x64"
+          }
+          python -m venv .venv-hse-motion-band
+          if ($LASTEXITCODE -ne 0) { throw "isolated venv failed" }
+          (Resolve-Path .venv-hse-motion-band\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install production frame processing dependencies only
+        shell: pwsh
+        run: |
+          python -m pip install -e .
+          if ($LASTEXITCODE -ne 0) { throw "source runtime dependencies unavailable" }
+      - name: Verify stable detector signature and focused-band tests
+        shell: pwsh
+        run: |
+          python -B -m unittest discover -s tests -p test_motion_signature_focus.py -v
+          if ($LASTEXITCODE -ne 0) { throw "signature study unit tests failed" }
+      - name: Prepare SHA-pinned FFmpeg video codec
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw "verified FFmpeg unavailable" }
+      - name: Generate eight moving MP4 and compare detector-only outputs
+        shell: pwsh
+        run: |
+          # Baseline plus two experimental bands; 4 languages x text/blank.
+          # No OCR models, network/provider login, profile data, or user media.
+          python -B tools/compare_motion_subtitle_band.py --languages ko,en,ja,zh
+          if ($LASTEXITCODE -ne 0) {
+            throw "moving video segmentation comparison incomplete"
+          }
+      - name: Clean isolated source environment
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Remove-Item .venv-hse-motion-band -Recurse -Force -ErrorAction SilentlyContinue

@@ -1,0 +1,72 @@
+name: HSE bounded sample-budget real OCR comparison
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-multiline-budget-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  same-video-ab:
+    if: ${{ contains(github.event.head_commit.message, '[hse-sampling-budget-qa]') }}
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Isolate x64 test dependencies
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'real pinned Windows x64 comparison required'
+          }
+          python -m venv .venv-hse-budget
+          if ($LASTEXITCODE -ne 0) { throw 'isolated environment failed' }
+          (Resolve-Path .venv-hse-budget\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install OCR dependencies and verify unchanged regressions
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[ocr]"
+          if ($LASTEXITCODE -ne 0) { throw 'verified OCR runtime unavailable' }
+          python -B -m unittest discover -s tests -p test_detector_sampling.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'bounded 3/5/7 sample selection regression' }
+          python -B -m unittest discover -s tests -p test_rapidocr_subtitle_filter.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'source subtitle filter regression' }
+          python -B -m unittest discover -s tests -p test_multiline_streaming_quality_report.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'reference/line-count audit regression' }
+      - name: Prepare pinned FFmpeg encoder and decoder
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'pinned FFmpeg unavailable' }
+      - name: Real PP-OCRv5 streaming quality on same white-two-line source bytes
+        shell: pwsh
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-sampling-budget-$env:GITHUB_RUN_ID"
+          if (Test-Path $scratch) { throw 'temporary model path already exists' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          try {
+            $models = Join-Path $scratch 'models'
+            python -B tools/prepare_models.py --languages ko,en,zh --out $models *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'verified OCR models unavailable' }
+            python -B tools/compare_multiline_sampling_budgets.py --model-dir $models
+            if ($LASTEXITCODE -ne 0) {
+              throw 'sampling budget comparison did not complete; no promotion'
+            }
+          }
+          finally {
+            Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Delete isolated virtual environment
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Remove-Item .venv-hse-budget -Recurse -Force -ErrorAction SilentlyContinue

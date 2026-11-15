@@ -1,0 +1,75 @@
+name: HSE public film-background subtitle image OCR benchmark (pinned)
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  geeklink-image-qa:
+    if: ${{ contains(github.event.head_commit.message, '[hse-geeklink-qa]') }}
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run offline public benchmark scoring and path-safety tests
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -B -m unittest discover -s tests -p test_geeklink_open_benchmark.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'public benchmark scorer contracts failed' }
+      - name: Fetch pinned CC0 and attributed CC-BY-SA film-image benchmark, no credentials
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "hse-public-film-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $root) { throw 'benchmark scratch path collision' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $env:GIT_TERMINAL_PROMPT = '0'
+          git -C $root init -q
+          if ($LASTEXITCODE -ne 0) { throw 'unable to create pinned-data checkout' }
+          git -C $root remote add origin https://github.com/GeekLinkDev/geeklink-ocr-benchmark.git
+          if ($LASTEXITCODE -ne 0) { throw 'unable to locate public benchmark' }
+          git -C $root -c credential.helper= fetch --depth=1 --no-tags origin baa9ccbb7ffad36d56cc0ea115256a09bdf427f4
+          if ($LASTEXITCODE -ne 0) { throw 'pinned public benchmark unavailable' }
+          git -C $root checkout -q --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'pinned benchmark checkout failed' }
+          $actual = (git -C $root rev-parse HEAD).Trim()
+          if ($actual -ne 'baa9ccbb7ffad36d56cc0ea115256a09bdf427f4') { throw 'unexpected public dataset commit' }
+          if (-not (Test-Path -LiteralPath (Join-Path $root 'LICENSE-DATA'))) { throw 'public dataset license missing' }
+          'HSE_PUBLIC_BENCH_PIN=PASS; LICENSE=REVIEWED_MIXED; NO_MEDIA_REDISTRIBUTION=TRUE'
+      - name: Isolate verified source OCR models and compare fixed stratified samples
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-geeklink-runtime-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $scratch) { throw 'benchmark virtual environment collision' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          $venv = Join-Path $scratch 'venv'
+          python -m venv $venv
+          if ($LASTEXITCODE -ne 0) { throw 'isolated runtime creation failed' }
+          $py = Join-Path $venv 'Scripts\python.exe'
+          & $py -m pip install --disable-pip-version-check -e ".[ocr]" *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'isolated OCR dependencies unavailable' }
+          $models = Join-Path $scratch 'models'
+          & $py -B tools/prepare_models.py --languages ko,en,zh --out $models *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'SHA-pinned four-language models unavailable' }
+          $dataset = Join-Path $env:RUNNER_TEMP "hse-public-film-$env:GITHUB_RUN_ID"
+          & $py -B tools/benchmark_geeklink_open_images.py --dataset $dataset --model-dir $models --all-available
+          if ($LASTEXITCODE -ne 0) { throw 'public source OCR generalization study failed' }
+      - name: Remove temporary film frames, models and isolated venv
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $dataset = Join-Path $env:RUNNER_TEMP "hse-public-film-$env:GITHUB_RUN_ID"
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-geeklink-runtime-$env:GITHUB_RUN_ID"
+          Remove-Item -LiteralPath $dataset -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue

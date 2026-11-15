@@ -1,0 +1,54 @@
+name: HSE selected official SeConv 5.4 isolated integration contracts (HOLD)
+
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+
+permissions:
+  contents: read
+
+jobs:
+  optional-seconv:
+    if: ${{ contains(github.event.head_commit.message, '[hse-seconv54-integration]') }}
+    runs-on: windows-2025
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Isolated optional SeConv 5.4 contracts (offline; no release download)
+        shell: pwsh
+        env:
+          PYTHONPATH: src
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Isolated Windows QA required' }
+          $temp = Join-Path $env:RUNNER_TEMP ('hse-seconv54-integration-' + $env:GITHUB_RUN_ID)
+          if (Test-Path -LiteralPath $temp) { throw 'Test runtime collision' }
+          python -m venv $temp
+          if ($LASTEXITCODE -ne 0) { throw 'No isolated Python environment' }
+          try {
+            $py = Join-Path $temp 'Scripts/python.exe'
+            & $py -m pip install --disable-pip-version-check -e .
+            if ($LASTEXITCODE -ne 0) { throw 'Declared free dependencies unavailable' }
+            & $py -B -c "import ast,pathlib; names=['src/hardsub_extractor/managed_seconv.py','src/hardsub_extractor/gui.py','src/hardsub_extractor/local_batch.py','src/hardsub_extractor/local_image_subtitles.py','src/hardsub_extractor/cli.py']; [ast.parse(pathlib.Path(n).read_text(encoding='utf-8')) for n in names]"
+            if ($LASTEXITCODE -ne 0) { throw 'Changed source syntax invalid' }
+            foreach ($pattern in @(
+              'test_managed_seconv_54.py',
+              'test_local_image_subtitles.py',
+              'test_local_batch.py',
+              'test_cli_local_soft_first.py',
+              'test_gui_diagnostic_privacy.py'
+            )) {
+              & $py -B -m unittest discover -s tests -p $pattern -q
+              if ($LASTEXITCODE -ne 0) { throw "SeConv 5.4 integration regression: $pattern" }
+            }
+            Write-Host 'HSE_SECONV54_OFFLINE_INTEGRATION=PASS;UPSTREAM_DOWNLOAD=0;HSE_OPERATING_INSTALL=UNCHANGED;MODEL_CALLS=0'
+          } finally {
+            Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+          }

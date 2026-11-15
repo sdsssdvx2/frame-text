@@ -1,0 +1,103 @@
+name: HSE official SeConv 5.3 vs 5.4 actual bitmap codec A/B (HOLD)
+
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+
+permissions:
+  contents: read
+
+jobs:
+  seconv-real-codec-comparison:
+    if: ${{ contains(github.event.head_commit.message, '[hse-seconv-54-ab]') }}
+    runs-on: windows-2025
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare isolated source runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 required' }
+          $scratch = Join-Path $env:RUNNER_TEMP ('hse-seconv-ab-' + $env:GITHUB_RUN_ID)
+          if (Test-Path -LiteralPath $scratch) { throw 'Existing private scratch must not be replaced' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          'HSE_SECONV_AB_SCRATCH=' + $scratch | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          python -B -c "import ast,pathlib; ast.parse(pathlib.Path('tools/compare_seconv_53_54.py').read_text(encoding='utf-8'))"
+          if ($LASTEXITCODE -ne 0) { throw 'Comparator source syntax invalid' }
+      - name: Prepare immutable official SeConv 5.3 and FFmpeg in checkout only
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_seconv_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned 5.3.0 unavailable' }
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned FFmpeg unavailable' }
+      - name: Fetch official SHA-verified SeConv 5.4 into runner scratch only
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:HSE_SECONV_AB_SCRATCH
+          $uri = 'https://github.com/SubtitleEdit/subtitleedit/releases/download/v5.4.0/SeConv-Windows-x64.zip'
+          $sha = 'aea19664f460fcfb84e8ba8eca72419091818c6005d4e063d9950c41ea81062d'
+          $zip = Join-Path $root 'official-5.4.zip'
+          Invoke-WebRequest -Uri $uri -OutFile $zip -MaximumRedirection 8
+          if ((Get-Item -LiteralPath $zip).Length -ne 43026089 -or
+              (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $sha) {
+            throw 'Official 5.4 release SHA/size mismatch'
+          }
+          Add-Type -AssemblyName System.IO.Compression
+          $read = [System.IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+            if ($read.Entries.Count -lt 2 -or $read.Entries.Count -gt 3000) { throw 'Unexpected portable archive file count' }
+            $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            [long]$total = 0
+            foreach ($item in $read.Entries) {
+              $name = $item.FullName.Replace('\','/')
+              if (-not $name -or $name.StartsWith('/') -or $name.Contains('//') -or
+                  $name.Contains(':') -or $name -match '(^|/)\.\.(/|$)' -or $name -match '(^|/)\.(/|$)') {
+                throw 'Unsafe official archive member name'
+              }
+              if (-not $seen.Add($name)) { throw 'Case-colliding release file' }
+              $total += [long]$item.Length
+              if ($total -gt 256MB) { throw 'Unbounded expanded official release' }
+              $kind = (($item.ExternalAttributes -shr 16) -band 61440)
+              if ($kind -eq 40960) { throw 'Symlink forbidden inside official release' }
+            }
+          } finally { $read.Dispose() }
+          $unpacked = Join-Path $root 'seconv-5.4'
+          Expand-Archive -LiteralPath $zip -DestinationPath $unpacked
+          $files = @(Get-ChildItem -LiteralPath $unpacked -Recurse -File -Force | Where-Object { $_.Name -ieq 'seconv.exe' })
+          if ($files.Count -ne 1) { throw 'Ambiguous official SeConv 5.4 executable' }
+          if (@(Get-ChildItem -LiteralPath $unpacked -Recurse -Force | Where-Object {
+              ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+          }).Count -gt 0) { throw 'Linked member from extracted portable tool' }
+          $exe = $files[0].FullName
+          $version = @(& $exe --version 2>&1)
+          if ($LASTEXITCODE -ne 0 -or ($version -join ' ') -notmatch '5\.4\.0') {
+            throw 'Official SeConv 5.4 version/runtime acceptance failed'
+          }
+          'HSE_SECONV_54_EXE=' + $exe | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host 'HSE_SECONV_54_RELEASE=OFFICIAL_SHA_AND_VERSION_PASS'
+      - name: Real identical MKV PGS and VobSub to BDN conversion in both versions
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $old = Join-Path $PWD 'bin/seconv/seconv.exe'
+          $ffmpeg = Join-Path $PWD 'bin/ffmpeg.exe'
+          python -B tools/compare_seconv_53_54.py --old $old --new $env:HSE_SECONV_54_EXE --ffmpeg $ffmpeg --scratch $env:HSE_SECONV_AB_SCRATCH
+          if ($LASTEXITCODE -ne 0) { throw 'SeConv 5.4 source bitmap track A/B failed; NO PROMOTION' }
+      - name: Remove only this trial's temporary release files
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $root = $env:HSE_SECONV_AB_SCRATCH
+          if ($root -and (Test-Path -LiteralPath $root)) {
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+          }

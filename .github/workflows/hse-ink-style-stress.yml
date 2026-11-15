@@ -1,0 +1,78 @@
+name: HSE two-line and colored subtitle stress study
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-ink-stress-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ink-stress:
+    if: ${{ contains(github.event.head_commit.message, '[hse-ink-style-stress]') }}
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create clean per-run Python environment
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw "Windows X64 genuine model test required"
+          }
+          python -m venv .venv-ink-stress
+          if ($LASTEXITCODE -ne 0) { throw "temporary environment failed" }
+          (Resolve-Path .venv-ink-stress\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install pinned OCR runtime and verify no regression in synthetic logic
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[ocr]"
+          if ($LASTEXITCODE -ne 0) { throw "required models runtime unavailable" }
+          python -B -m unittest discover -s tests -p test_ink_boundary_refinement.py -v
+          if ($LASTEXITCODE -ne 0) { throw "ink geometry unit tests failed" }
+          python -B -m unittest discover -s tests -p test_rapidocr_subtitle_filter.py -v
+          if ($LASTEXITCODE -ne 0) { throw "production subtitle filter regressed" }
+          python -B -m unittest discover -s tests -p test_palette_ink_boundary.py -v
+          if ($LASTEXITCODE -ne 0) { throw "palette boundary offline regressions failed" }
+      - name: Pin FFmpeg source encoder and decoder
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw "verified FFmpeg setup failed" }
+      - name: Evaluate real four-language OCR anchors on novel text layouts
+        shell: pwsh
+        run: |
+          $temp = Join-Path $env:RUNNER_TEMP "hse-ink-style-$env:GITHUB_RUN_ID"
+          if (Test-Path $temp) { throw "model path unexpectedly exists" }
+          $models = Join-Path $temp "models"
+          New-Item -ItemType Directory -Path $temp | Out-Null
+          try {
+            python -B tools/prepare_models.py --languages ko,en,zh --out $models *> $null
+            if ($LASTEXITCODE -ne 0) { throw "pinned models unavailable" }
+            python -B tools/stress_ink_boundary_styles.py --model-dir $models
+            if ($LASTEXITCODE -ne 0) {
+              throw "two-line and color stress comparison did not complete"
+            }
+            # Report text fidelity and line count separately from pixel-only timing.
+            # A timing-only 24/24 does not prove that both subtitle lines survived.
+            python -B tools/experiment_palette_ink_boundary.py --model-dir $models
+            if ($LASTEXITCODE -ne 0) {
+              throw "palette candidate study did not complete; do not promote it"
+            }
+          }
+          finally {
+            Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Delete isolated runtime
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Remove-Item .venv-ink-stress -Recurse -Force -ErrorAction SilentlyContinue

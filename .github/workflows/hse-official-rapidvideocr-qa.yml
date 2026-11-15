@@ -1,0 +1,95 @@
+name: HSE actual mature RapidVideOCR PyPI OCR pipeline versus source language reference
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-real-rapidvideocr-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  official-rapidvideocr:
+    if: ${{ contains(github.event.head_commit.message, '[hse-official-videocr-qa]') }}
+    runs-on: windows-2025
+    timeout-minutes: 32
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create disposable pinned OCR study venv
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 required' }
+          if (Test-Path .venv-hse-official-videocr) { throw 'research environment path collision' }
+          python -m venv .venv-hse-official-videocr
+          if ($LASTEXITCODE -ne 0) { throw 'isolated virtual environment unavailable' }
+          (Resolve-Path .venv-hse-official-videocr\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install HSE's model runtime in temporary environment
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[ocr]"
+          if ($LASTEXITCODE -ne 0) { throw 'existing OCR runtime unavailable' }
+      - name: Install official RapidVideOCR 3.1.1 verified PyPI wheel, without dependency upgrades
+        shell: pwsh
+        run: |
+          $pin = Join-Path $env:RUNNER_TEMP "hse-official-videocr-$env:GITHUB_RUN_ID.txt"
+          if (Test-Path -LiteralPath $pin) { throw 'pin collision' }
+          'rapid-videocr==3.1.1 --hash=sha256:5ccfa46f9911eb02c21a4e60946e2fd4d1c282ddbdfcd4f8a780e867816e56b2' | Set-Content -LiteralPath $pin -Encoding ascii
+          try {
+            python -m pip install --no-cache-dir --no-deps --require-hashes -r $pin
+            if ($LASTEXITCODE -ne 0) { throw 'PyPI wheel does not match official SHA' }
+            python -B -c "from importlib.metadata import version; assert version('rapid-videocr') == '3.1.1'"
+            if ($LASTEXITCODE -ne 0) { throw 'third-party installed version mismatch' }
+          }
+          finally {
+            Remove-Item -LiteralPath $pin -Force -ErrorAction SilentlyContinue
+          }
+      - name: Run 10 offline third-party publisher and scorer contracts
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -B -m unittest discover -s tests -p test_official_rapid_videocr_entrypoint_contract.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'explicit OCR path entrypoint regressions failed' }
+          python -B -m unittest discover -s tests -p test_official_rapid_videocr.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'official OCR study contracts failed' }
+          python -B -m unittest discover -s tests -p test_external_engine_exports.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'reference grading contract failed' }
+          python -B -m unittest discover -s tests -p test_vsf_timing_research.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'official native source contract failed' }
+      - name: Prepare independently pinned LGPL FFmpeg video fixture encoder
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'pinned codec unavailable' }
+      - name: Run 4-language official RapidVideOCR OCR on native VSF RGBImages, verify SRT/ASS and safe normalization
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-official-rv-models-$env:GITHUB_RUN_ID"
+          if (Test-Path $scratch) { throw 'OCR model scratch collision' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          try {
+            $models = Join-Path $scratch 'v5-pinned'
+            python -B tools/prepare_models.py --languages ko,en,zh --out $models *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'required original model hash mismatch' }
+            python -B tools/compare_official_rapid_videocr.py --model-dir $models --languages ko,en,ja,zh
+            if ($LASTEXITCODE -ne 0) { throw 'official upstream SRT/ASS OCR comparison incomplete' }
+          }
+          finally {
+            Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Destroy isolated third-party OCR Python venv
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Remove-Item .venv-hse-official-videocr -Recurse -Force -ErrorAction SilentlyContinue

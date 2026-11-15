@@ -1,0 +1,52 @@
+name: HSE local temporal watermark manual review integration (HOLD)
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+permissions:
+  contents: read
+jobs:
+  windows-temporal-manual-review:
+    if: ${{ contains(github.event.head_commit.message, '[hse-temporal-review-ui]') }}
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify installed temporal engine plus GUI reviewed cue selection with isolated free OCR
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 only' }
+          $scratch=Join-Path $env:RUNNER_TEMP "hse-temporal-review-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $scratch) { throw 'scratch collision' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          try {
+            python -m venv (Join-Path $scratch 'venv')
+            if ($LASTEXITCODE -ne 0) { throw 'temporary Python unavailable' }
+            $py=Join-Path $scratch 'venv\Scripts\python.exe'
+            $env:PYTHONPATH="$env:GITHUB_WORKSPACE\src;$env:GITHUB_WORKSPACE\tools"
+            $env:TMP=$scratch; $env:TEMP=$scratch
+            # This is a pure metadata classifier; verify it imports before
+            # installing any native OCR packages in the disposable venv.
+            & $py -B -c "from hardsub_extractor.temporal_review import LineTrace, find_candidates; assert find_candidates([], 7.0) == set()"
+            if ($LASTEXITCODE -ne 0) { throw 'temporal policy unexpectedly requires native OCR libraries' }
+            & $py -m pip install --disable-pip-version-check -e '.[ocr]' *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'free OCR dependencies unavailable' }
+            foreach ($name in @('test_temporal_overlay_quarantine.py', 'test_temporal_review_gui.py', 'test_gui_frame_review.py', 'test_subtitle_review_pack.py')) {
+              & $py -B -m unittest discover -s tests -p $name -v
+              if ($LASTEXITCODE -ne 0) { throw "failed targeted regression: $name" }
+            }
+            Write-Host 'HSE_TEMPORAL_GUI_REVIEW=PASS;REAL_USER_DATA=NONE;OCR_INFERENCE=NONE;AUTODELETE=OFF;OPERATING=UNCHANGED;RELEASE=HOLD'
+          }
+          finally {
+            if (Test-Path -LiteralPath $scratch) {
+              Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }

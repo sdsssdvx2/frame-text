@@ -1,0 +1,62 @@
+name: HSE reference-free moving video detector window audit
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-detector-window-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  detector-window:
+    if: ${{ contains(github.event.head_commit.message, '[hse-detector-window-audit]') }}
+    runs-on: windows-2025
+    timeout-minutes: 13
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create isolated detector-only runtime
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'real Windows video decoder required'
+          }
+          if (Test-Path .venv-detector-windows) { throw 'unexpected existing test runtime' }
+          python -m venv .venv-detector-windows
+          if ($LASTEXITCODE -ne 0) { throw 'isolated Python runtime failed' }
+          (Resolve-Path .venv-detector-windows\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install no OCR models and test reference-free labeling
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+        run: |
+          python -m pip install "numpy>=2.0" "opencv-python-headless>=4.10" "Pillow>=10"
+          if ($LASTEXITCODE -ne 0) { throw 'standalone image codecs unavailable' }
+          python -B -m unittest discover -s tests -p test_quiet_detector_window_audit.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'detector timeline audit invalid' }
+          python -B -m unittest discover -s tests -p test_detector_sampling.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'detector sample regression' }
+      - name: Prepare verified FFmpeg
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'verified FFmpeg unavailable' }
+      - name: Compare default, quiet-only and bounded pending-change detector sample locations
+        shell: pwsh
+        env:
+          PYTHONPATH: "src;tools"
+        run: |
+          python -B tools/diagnose_quiet_detector_windows.py
+          if ($LASTEXITCODE -ne 0) { throw 'reference-free detector audit failed' }
+      - name: Remove temporary Python runtime
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Remove-Item .venv-detector-windows -Recurse -Force -ErrorAction SilentlyContinue

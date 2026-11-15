@@ -1,0 +1,51 @@
+name: HSE licensed film CJK OCR ROI comparison (research HOLD)
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+permissions:
+  contents: read
+jobs:
+  cc-film-still-ocr:
+    if: ${{ contains(github.event.head_commit.message, '[hse-licensed-cjk-stills]') }}
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compare SHA-pinned licensed film captions with free CJK OCR
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 only' }
+          $scratch=Join-Path $env:RUNNER_TEMP "hse-cjk-film-stills-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $scratch) { throw 'scratch collision' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          try {
+            python -m venv (Join-Path $scratch 'venv')
+            if ($LASTEXITCODE -ne 0) { throw 'disposable Python failed' }
+            $py=Join-Path $scratch 'venv\Scripts\python.exe'
+            $env:PYTHONPATH="$env:GITHUB_WORKSPACE\src;$env:GITHUB_WORKSPACE\tools"
+            $env:TEMP=$scratch; $env:TMP=$scratch
+            & $py -m pip install --disable-pip-version-check -e '.[ocr]' *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'free OCR runtime unavailable' }
+            & $py -B tools/bench_geeklink_cjk_real_frames.py --self-test
+            if ($LASTEXITCODE -ne 0) { throw 'new benchmark invariant failed' }
+            $models=Join-Path $scratch 'models'
+            & $py -B tools/prepare_models.py --languages zh --out $models --prefer-mirrors --timeout-seconds 22 --attempts 1 *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'verified free CJK models unavailable' }
+            & $py -B tools/bench_geeklink_cjk_real_frames.py --accept-public-download --model-dir $models --manifest models/manifest.json
+            if ($LASTEXITCODE -ne 0) { throw 'real-film-background CJK OCR trial failed' }
+            Write-Host 'HSE_PINNED_CJK_STILLS=MEASURED;USER_DATA=NO;OPERATING_APP=UNCHANGED;RELEASE=HOLD'
+          }
+          finally {
+            if (Test-Path -LiteralPath $scratch) {
+              Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }

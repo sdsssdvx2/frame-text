@@ -1,0 +1,175 @@
+name: HSE independently pinned AVL video-OCR public trial (research HOLD)
+
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: hse-avl-independent-natural-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  isolated-public-ocr:
+    if: ${{ contains(github.event.head_commit.message, '[hse-avl-natural-qa]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify only new no-network public source/output contracts
+        shell: bash
+        env:
+          PYTHONPATH: "tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          python -B -m unittest discover -s tests -p test_avl_public_natural.py -v
+
+      - name: Create dedicated disposable source/output paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch="$(mktemp -d "$RUNNER_TEMP/hse-avl-natural-$GITHUB_RUN_ID-XXXXXXXX")"
+          chmod 755 "$scratch"
+          echo "HSE_AVL_SCRATCH=$scratch" >> "$GITHUB_ENV"
+          echo "HSE_AVL_IMAGE=hse-avl-natural:$GITHUB_RUN_ID" >> "$GITHUB_ENV"
+
+      - name: Download original public caption/control video and exact official transcript
+        shell: bash
+        env:
+          PYTHONPATH: "tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          python -B tools/verify_avl_public_natural.py prepare --source "$HSE_AVL_SCRATCH/media"
+          chmod 755 "$HSE_AVL_SCRATCH/media"
+          chmod 644 "$HSE_AVL_SCRATCH/media/"*.webm "$HSE_AVL_SCRATCH/media/"*.srt
+          mkdir "$HSE_AVL_SCRATCH/output"
+          chmod 0777 "$HSE_AVL_SCRATCH/output"
+
+      - name: Fetch only immutable official AVL git commit into PUBLIC Docker context
+        shell: bash
+        run: |
+          set -euo pipefail
+          up="$HSE_AVL_SCRATCH/AVL-upstream"
+          commit="ee0269df692719b658ccae0e75106e9b84af40ec"
+          git init -q "$up"
+          git -C "$up" -c credential.helper= fetch --depth=1 --no-tags \
+            https://github.com/allvoicelab/AVL-SubtitleOCR.git "$commit" >/dev/null 2>&1
+          git -C "$up" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$up" rev-parse HEAD)" = "$commit"
+          test -f "$up/avl-open/avl_open_ocr/cli.py"
+          test -d "$up/avl-open/avl_open_ocr/model_files"
+          python - "$up/avl-open/avl_open_ocr/model_files" <<'PY'
+          from pathlib import Path
+          import sys
+          files = list(Path(sys.argv[1]).glob("*.onnx"))
+          if len(files) < 2 or any(f.stat().st_size < 4096 for f in files):
+              raise SystemExit("official ONNX model payload missing; external trial rejected")
+          print("HSE_AVL_OFFICIAL_SHA=PASS;MODEL_FILES_PRESENT=YES;NO_MODEL_DOWNLOAD_AT_RUNTIME=YES")
+          PY
+
+      - name: Build public-source-only offline container (private HSE repo not in context)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --progress=plain -f "$GITHUB_WORKSPACE/.github/ci/hse-avl-natural.Dockerfile" \
+            -t "$HSE_AVL_IMAGE" "$HSE_AVL_SCRATCH/AVL-upstream" > "$HSE_AVL_SCRATCH/docker-build.log" 2>&1 \
+            || { echo 'HSE_AVL_BUILD=BLOCKED;NO_EXTERNAL_ENGINE_RUN'; exit 1; }
+          echo "HSE_AVL_PUBLIC_SOURCE_IMAGE=BUILT;PRIVATE_REPO_NOT_COPIED=YES"
+
+      - name: Run REAL AVL English OCR, caption and no-caption, offline and non-root
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="$HSE_AVL_SCRATCH/media"
+          output="$HSE_AVL_SCRATCH/output"
+          for name in caption clean; do
+            # Only ONE pinned video is visible to the vendor process.
+            # The publisher's independent reference.srt and other media are
+            # NEVER mounted in the sandbox, preventing answer contamination.
+            # No checkout, account files, host secrets, browser profiles
+            # or Docker socket are mounted.
+            timeout 1150s docker run --rm --network none --read-only \
+              --cap-drop ALL --security-opt no-new-privileges \
+              --pids-limit 256 --memory 6g --cpus 4 \
+              --tmpfs /tmp:rw,nosuid,nodev,size=512m \
+              --user 65534:65534 \
+              --mount "type=bind,source=$source/$name.webm,target=/media/$name.webm,readonly" \
+              --mount "type=bind,source=$output,target=/output" \
+              "$HSE_AVL_IMAGE" "/media/$name.webm" \
+              -o "/output/$name-result" --lang en \
+              --backend subtle-v5 --recognizer v6_small --postprocess f1 \
+              --device cpu --ocr-interval 2 --pre-scan-interval 2 \
+              --det-workers 2 --num-threads 2 \
+              > "$HSE_AVL_SCRATCH/$name.stdout.log" \
+              2> "$HSE_AVL_SCRATCH/$name.stderr.log" \
+              || { echo "HSE_AVL_${name^^}_EXECUTION=FAILED_OR_TIMED_OUT"; exit 1; }
+            echo "HSE_AVL_${name^^}_EXECUTION=COMPLETE;OUTPUT_NEEDS_VERIFICATION=YES"
+          done
+
+      - name: Compare independent publisher SRT with actual AVL SRT and clean control
+        shell: bash
+        env:
+          PYTHONPATH: "tools"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          python -B tools/verify_avl_public_natural.py score \
+            --source "$HSE_AVL_SCRATCH/media" --output "$HSE_AVL_SCRATCH/output"
+
+      - name: Remove only this research run's public media, vendor checkout and Docker image
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [ -n "${HSE_AVL_SCRATCH:-}" ] && \
+             [[ "$HSE_AVL_SCRATCH" == "$RUNNER_TEMP"/hse-avl-natural-"$GITHUB_RUN_ID"-* ]]; then
+            rm -rf -- "$HSE_AVL_SCRATCH"
+          fi
+          if [ -n "${HSE_AVL_IMAGE:-}" ]; then
+            docker image rm "$HSE_AVL_IMAGE" >/dev/null 2>&1 || true
+          fi
+
+      - name: Report execution status only, NEVER auto-authorize OCR quality or release
+        if: ${{ always() }}
+        shell: bash
+        env:
+          HSE_GITHUB_STATUS_TOKEN: ${{ github.token }}
+          HSE_RESEARCH_JOB_STATE: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          if [ "$HSE_RESEARCH_JOB_STATE" = "success" ]; then
+            state="success"
+            desc="AVL offline public trial executed; quality and release NOT approved"
+          elif [ "$HSE_RESEARCH_JOB_STATE" = "failure" ]; then
+            state="failure"
+            desc="AVL public trial blocked or failed; release NOT approved"
+          else
+            state="error"
+            desc="AVL public trial interrupted; release NOT approved"
+          fi
+          body="$(python -c 'import json,os,sys; print(json.dumps({
+            "state":sys.argv[1],
+            "context":"hse/research-independent-avl-natural",
+            "description":sys.argv[2],
+            "target_url":"https://github.com/"+os.environ["GITHUB_REPOSITORY"]+"/actions/runs/"+os.environ["GITHUB_RUN_ID"]
+          }))' "$state" "$desc")"
+          curl --fail --silent --show-error --max-time 15 -X POST \
+            -H "Authorization: Bearer $HSE_GITHUB_STATUS_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            --data "$body" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            > /dev/null || echo "HSE_AVL_COMMIT_STATUS=UNPUBLISHED"
+          echo "HSE_AVL_RESEARCH_JOB=$state;RELEASE_APPROVAL=NEVER_AUTOMATIC"

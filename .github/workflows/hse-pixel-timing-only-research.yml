@@ -1,0 +1,46 @@
+name: HSE text-preserving pixel timing isolated integration (HOLD)
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+permissions:
+  contents: read
+jobs:
+  opt-in-pixel-timing:
+    if: ${{ contains(github.event.head_commit.message, '[hse-pixel-only]') }}
+    runs-on: windows-2025
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate opt-in wiring and existing optical contracts without model requests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 required' }
+          $scratch=Join-Path $env:RUNNER_TEMP "hse-pixel-only-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $scratch) { throw 'scratch collision' }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          try {
+            python -m venv (Join-Path $scratch 'venv')
+            if ($LASTEXITCODE -ne 0) { throw 'isolated interpreter unavailable' }
+            $py=Join-Path $scratch 'venv\Scripts\python.exe'
+            & $py -m pip install --disable-pip-version-check -e '.[ocr]' *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'isolated free runtime unavailable' }
+            & $py -B -m unittest discover -s tests -p test_pixel_timing_only_mode.py -v
+            if ($LASTEXITCODE -ne 0) { throw 'pixel timing only wiring failed' }
+            & $py -B -m unittest discover -s tests -p test_light_temporal.py -q
+            if ($LASTEXITCODE -ne 0) { throw 'existing optical timing contract regressed' }
+            & $py -B -m unittest discover -s tests -p test_local_batch.py -q
+            if ($LASTEXITCODE -ne 0) { throw 'local batch adjacent behavior regressed' }
+            Write-Host 'HSE_PIXEL_ONLY_WIRING=PASS;ORIGINAL_TEXT_AND_CUE_COUNT=PIPELINE_INVARIANT;LIVE_VIDEO_QUALITY=NOT_MEASURED;RELEASE=HOLD'
+          }
+          finally {
+            if (Test-Path -LiteralPath $scratch) {
+              Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }

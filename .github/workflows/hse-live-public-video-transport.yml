@@ -1,0 +1,59 @@
+name: HSE real public video transport (bounded opt-in)
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-video-transport-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  video-transport:
+    if: ${{ contains(github.event.head_commit.message, '[hse-public-video-live]') }}
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install bounded source runtime without OCR models
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw "isolated Windows x64 runner required"
+          }
+          python -m venv .venv-hse-public-video
+          if ($LASTEXITCODE -ne 0) { throw "temporary Python environment failed" }
+          (Resolve-Path .venv-hse-public-video\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install pinned production dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -e .
+          if ($LASTEXITCODE -ne 0) { throw "production requirements unavailable" }
+      - name: Pin and verify independent FFmpeg and yt-dlp
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw "pinned FFmpeg unavailable" }
+          pwsh -NoProfile -File tools/prepare_yt_dlp_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw "pinned yt-dlp unavailable" }
+      - name: Fetch one tiny public video and verify source-only OCR transport
+        shell: pwsh
+        run: |
+          # 19s CC-BY reference. No user media or browser profiles accessed.
+          # Video stays only in TemporaryDirectory and is deleted on exit.
+          python -B tools/verify_live_public_video_transport.py
+          if ($LASTEXITCODE -ne 0) {
+            throw "live public-video transport not verified (may be external access restriction)"
+          }
+      - name: Clean isolated runtime environment
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Remove-Item .venv-hse-public-video -Recurse -Force -ErrorAction SilentlyContinue

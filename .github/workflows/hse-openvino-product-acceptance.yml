@@ -1,0 +1,141 @@
+name: HSE bundled OpenVINO product acceptance
+
+on:
+  push:
+    branches:
+      - research/rapidvideocr-explicit-path-args-20261107
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-openvino-product-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  frozen-openvino-product:
+    if: ${{ contains(github.event.head_commit.message, '[hse-openvino-product]') || contains(github.event.head_commit.message, '[hse-openvino-auto]') }}
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare exact free runtime and required bundled assets
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw 'Windows x64 frozen product acceptance only'
+          }
+          python -m pip install --disable-pip-version-check -e ".[ocr,accelerated]" pyinstaller *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'free accelerated Python runtime unavailable' }
+          $ov = python -c "import importlib.metadata as m; print(m.version('openvino'))"
+          if ($LASTEXITCODE -ne 0 -or $ov.Trim() -ne '2026.4.1') {
+            throw 'OpenVINO 2026.4.1 pin mismatch'
+          }
+          python tools/prepare_models.py *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'pinned OCR models unavailable' }
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1 *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'pinned LGPL FFmpeg unavailable' }
+          pwsh -NoProfile -File tools/prepare_seconv_ci.ps1 *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'pinned free SeConv unavailable' }
+          pwsh -NoProfile -File tools/prepare_yt_dlp_ci.ps1 *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'pinned public-caption helper unavailable' }
+      - name: Recheck only changed backend and frozen contracts
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: "src;tools"
+        run: |
+          $ErrorActionPreference='Stop'
+          foreach ($suite in @(
+            'test_ocr_backend_product.py',
+            'test_rapidocr_thread_options.py',
+            'test_frozen_multilingual_ocr_acceptance.py',
+            'test_gui_local_ocr_preview.py'
+          )) {
+            python -B -m unittest discover -s tests -p $suite -q
+            if ($LASTEXITCODE -ne 0) { throw "changed OpenVINO product contract failed: $suite" }
+          }
+      - name: Build one self-contained Windows EXE with both CPU backends
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          pyinstaller --noconfirm --clean HardSubtitleExtractor.spec *> artifacts-openvino-build.log
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path dist/HardSubtitleExtractor.exe)) {
+            if (Test-Path artifacts-openvino-build.log) { Get-Content artifacts-openvino-build.log -Tail 120 }
+            throw 'OpenVINO frozen EXE build failed'
+          }
+          $exe = Get-Item dist/HardSubtitleExtractor.exe
+          $sha = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "HSE_OPENVINO_EXE_BUILD=PASS;BYTES=$($exe.Length);SHA256=$sha"
+      - name: Frozen ONNX and OpenVINO run the same four-language videos
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: "src;tools"
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $env:RUNNER_TEMP "hse-openvino-product-$env:GITHUB_RUN_ID"
+          if (Test-Path -LiteralPath $root) { throw 'owned product scratch collision' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          try {
+            $fixtures=Join-Path $root 'fixtures'
+            python -B tools/prepare_frozen_multilingual_video_fixtures.py --out $fixtures
+            if ($LASTEXITCODE -ne 0) { throw 'bounded multilingual fixtures failed' }
+            foreach ($backend in @('onnxruntime','openvino','auto')) {
+              $expectedBackend = if ($backend -eq 'auto') { 'openvino' } else { $backend }
+              $report=Join-Path $root ($backend + '.json')
+              $proc=Start-Process -FilePath dist/HardSubtitleExtractor.exe -ArgumentList @(
+                '--multilingual-ocr-acceptance',
+                '--ocr-fixture-dir', $fixtures,
+                '--ocr-acceptance-report', $report,
+                '--ocr-acceptance-backend', $backend
+              ) -PassThru
+              $deadline=(Get-Date).AddMinutes(9)
+              while (-not $proc.HasExited) {
+                if ((Get-Date) -ge $deadline) {
+                  Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                  throw "frozen $backend OCR timed out"
+                }
+                Start-Sleep -Seconds 3
+                $proc.Refresh()
+              }
+              if ($proc.ExitCode -ne 0 -or -not (Test-Path $report)) {
+                throw "frozen $backend OCR did not complete"
+              }
+              $data=Get-Content $report -Raw | ConvertFrom-Json
+              if ($data.schema -ne 1 -or $data.ok -ne $true -or
+                  $data.is_frozen -ne $true -or
+                  $data.requested_inference_engine -ne $backend -or
+                  $data.inference_engine -ne $expectedBackend -or
+                  $data.no_external_requests -ne $true -or
+                  $data.temporary_outputs_removed -ne $true -or
+                  $data.original_text_exact_total -ne 8 -or
+                  @($data.languages).Count -ne 4) {
+                throw "frozen $backend acceptance invariant failed"
+              }
+              foreach ($lang in @('ko','en','ja','zh')) {
+                $rows=@($data.languages | Where-Object { $_.language -eq $lang })
+                if ($rows.Count -ne 1 -or
+                    $rows[0].requested_inference_engine -ne $backend -or
+                    $rows[0].inference_engine -ne $expectedBackend -or
+                    $rows[0].original_text_exact_cues -ne 2 -or
+                    $rows[0].srt_ass_verified -ne $true -or
+                    [double]$rows[0].max_timing_error_seconds -gt 0.65 -or
+                    [double]$rows[0].max_srt_ass_timing_delta_seconds -gt 0.02) {
+                  throw "frozen $backend failed exact OCR for $lang"
+                }
+              }
+              Write-Host "HSE_FROZEN_BACKEND_PASS=$backend;ACTUAL=$expectedBackend;LANGUAGES=4;EXACT_CUES=8"
+            }
+          }
+          finally {
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+          }

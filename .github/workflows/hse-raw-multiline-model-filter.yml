@@ -1,0 +1,68 @@
+name: HSE real model raw-versus-filtered two-line box analysis
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hse-raw-multiline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  model-geometry:
+    if: ${{ contains(github.event.head_commit.message, '[hse-raw-multiline]') }}
+    runs-on: windows-2025
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Isolate real Windows model runtime
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+            throw "requires real Windows x64 model runtime"
+          }
+          python -m venv .venv-hse-raw-lines
+          if ($LASTEXITCODE -ne 0) { throw "new isolated test runtime unavailable" }
+          (Resolve-Path .venv-hse-raw-lines\Scripts).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Install pinned OCR runtime and run classification regressions
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[ocr]"
+          if ($LASTEXITCODE -ne 0) { throw "required OCR runtime unavailable" }
+          python -B -m unittest discover -s tests -p test_raw_multiline_model_filter.py -v
+          if ($LASTEXITCODE -ne 0) { throw "raw/filter classification contract failed" }
+          python -B -m unittest discover -s tests -p test_rapidocr_subtitle_filter.py -v
+          if ($LASTEXITCODE -ne 0) { throw "existing upper-row filter regressed" }
+      - name: Verify real FFmpeg
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tools/prepare_ffmpeg_ci.ps1
+          if ($LASTEXITCODE -ne 0) { throw "pinned FFmpeg unavailable" }
+      - name: Compare source auto-sampled raw OCR boxes with accepted subtitle text
+        shell: pwsh
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP "hse-raw-multiline-$env:GITHUB_RUN_ID"
+          if (Test-Path $scratch) { throw "isolation directory already exists" }
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          try {
+            $models = Join-Path $scratch "models"
+            python -B tools/prepare_models.py --languages ko,en,zh --out $models *> $null
+            if ($LASTEXITCODE -ne 0) { throw "SHA-pinned model preparation failed" }
+            python -B tools/diagnose_raw_multiline_ocr_boxes.py --model-dir $models --languages ko,ja
+            if ($LASTEXITCODE -ne 0) { throw "raw-versus-filtered study incomplete" }
+          }
+          finally {
+            Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Delete isolated runtime
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          Remove-Item .venv-hse-raw-lines -Recurse -Force -ErrorAction SilentlyContinue
